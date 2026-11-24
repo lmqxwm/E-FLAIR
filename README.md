@@ -132,7 +132,7 @@ The data are those of the benchmark of Ovaskainen et al. (2025)
 (`allData.RData`, `MT_Madagascar.RData`) and are not included here. The script
 fits the reported configuration ($k=40$, $H=40$) on both prediction tasks and
 writes `results_madagascar/summary.txt` with the AUC by prevalence group. It
-needs one node with about 30 cores and 200 GB of memory, and runs in about
+needs one node with about 32 cores and 64 GB of memory, and runs in about
 1.5 hours.
 
 Simulation: `numerical_exp.rmd` reproduces the simulation study. Set
