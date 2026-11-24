@@ -46,7 +46,6 @@ The C++ helpers are compiled by `Rcpp::sourceCpp` when the R files are sourced.
 | `sim_uq_functions.R` | Simulation data-generating process and method runners |
 | `numerical_exp.rmd` | Simulation study notebook |
 | `flair_plus_minibatch_tr.R` | Earlier fitter used by parts of the notebook |
-| `figures/` | Simulation figures and tables |
 
 ## Quick start
 
