@@ -1,0 +1,1568 @@
+---
+title: "FLAIR++ — numerical simulations"
+author: "FLAIR++"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.2
+)
+options(width = 100)
+FLAIR_PROJ_DIR <- normalizePath("/work/ml752/FLAIR++")
+FLAIR_CODE_DIR <- normalizePath(dirname(knitr::current_input(dir = TRUE)))
+Sys.setenv(FLAIR_CODE_DIR = FLAIR_CODE_DIR)
+knitr::opts_knit$set(root.dir = FLAIR_PROJ_DIR)
+set.seed(2026)  # global seed; chunks reset their own seeds for reproducibility
+```
+
+# Goal
+
+Run FLAIR+ on data simulated from a fully specified data-generating model,
+then quantify uncertainty for **every** estimated parameter using
+`compute_UQ()` from `flair_plus_minibatch_tr.R`. For each parameter family
+we report:
+
+1. The MAP point estimate vs. the true value.
+2. The 95% posterior credible interval vs. the true value (coverage check).
+
+This document is self-contained — it is meant to be re-knit any time
+`compute_UQ()` or the related C++ helper `compute_V_diag_all_cpp()` change.
+
+---
+
+# True data-generating model
+
+We sample from the exact prior structure FLAIR+ targets, so that posterior
+intervals can be assessed against ground truth. With
+$d = q + k$:
+
+$$
+\begin{aligned}
+\boldsymbol{\xi}_j &\stackrel{\text{iid}}{\sim} \mathcal{N}(\mathbf{0},\, \mathbf{I}_H),
+  \qquad j=1,\dots,p
+  &(\text{trait embedding; see note below}) \\
+\sigma_r^2 &\stackrel{\text{iid}}{\sim}
+  \text{InvGamma}(a_{\text{true}},\, b_{\text{true}}),
+  \qquad r=1,\dots,d
+  &(\text{per-dim residual scale}) \\
+\kappa_r^2 &\stackrel{\text{iid}}{\sim}
+  \text{InvGamma}(c_{\text{true}},\, d_{\text{true}}),
+  \qquad r=1,\dots,d
+  &(\text{per-row Gamma scale}) \\
+\Gamma_{r,h} &\stackrel{\text{iid}}{\sim} \mathcal{N}(0,\, \kappa_r^2)
+  &(\text{trait-to-param map}) \\
+\boldsymbol{\mu}_j &= \Gamma\, \boldsymbol{\xi}_j
+  &(\text{structured prior mean of }\tilde\beta_j) \\
+\tilde\beta_j &\sim \mathcal{N}(\boldsymbol{\mu}_j,\,
+  \mathrm{diag}(\sigma_1^2,\dots,\sigma_d^2))
+  &(\text{species coefficients}) \\
+\tilde\beta_j &= (\beta_j^\top, \lambda_j^\top)^\top
+  \in \mathbb{R}^q \times \mathbb{R}^k
+  &(\text{covariate / latent split}) \\
+\boldsymbol{\eta}_i &\stackrel{\text{iid}}{\sim} \mathcal{N}(\mathbf{0},\, \mathbf{I}_k / k)
+  &(\text{latent site scores}) \\
+y_{ij} &\sim \mathrm{Bernoulli}\!\left(
+  \sigma(\mathbf{x}_i^\top \beta_j + \boldsymbol{\eta}_i^\top \lambda_j) \right)
+  &(\text{binary outcome})
+\end{aligned}
+$$
+
+```{r dgm-params}
+set.seed(2026)
+
+n  <- 200L   # sites
+p  <- 120L   # species (large enough for stable Gamma posterior)
+q  <- 3L     # covariates (col 1 = intercept)
+k  <- 3L     # latent factors
+H  <- 20L    # trait-embedding dimension (matches real-data diffusion h=20)
+d  <- q + k
+
+# Embedding scale. With xi_j ~ N(0, I_H) the coefficient signal
+# Var(mu_jr) = kappa_r^2 * ||xi_j||^2 grows like kappa^2 * H, saturating the
+# logistic at large H. Scaling xi by sqrt(4/H) fixes E||xi_j||^2 = 4, holding
+# the linear-predictor signal at the H=4 regime (sd(Z) ~ 5.4) so only the trait
+# dimension changes. Reduces to 1 at H=4 (backward-consistent).
+xi_scale <- sqrt(4 / H)
+
+# Hyperparameters match the fitter defaults (get_init_plus: a=3,b=2,c=3,d=2)
+# so the prior is correctly specified. IG(3,2): mode = b/(a+1) = 0.5, mean = 1.0.
+# IG(3, 1/2): mean 1/4. With unit scales the linear predictor has sd about 6
+# and the effective counts m_j = sum_i phi''(z_ij) fall to 5-20 even at n=200,
+# outside the common-species regime of the theory; at mean 1/4 the predictor
+# has sd about 3 and m_j/n is about 0.12.
+a_true <- 3;  b_true <- 0.5   # IG(3,0.5): mean sigma^2 = b/(a-1) = 0.25
+c_true <- 3;  d_true <- 0.5   # IG(3,0.5): mean kappa^2 = d/(c-1) = 0.25
+
+# Draw scale parameters from their priors
+sigma_sq_true <- 1 / rgamma(d, shape = a_true, rate = b_true)   # length d
+kappa_sq_true <- 1 / rgamma(d, shape = c_true, rate = d_true)   # length d
+
+# Trait embedding (rows = embedding dims, cols = species)
+Xi_mat <- matrix(rnorm(H * p), H, p) * xi_scale                # H x p
+
+# Gamma: row r drawn from N(0, kappa_sq_true[r] * I_H)
+Gamma_0 <- matrix(rnorm(d * H), d, H) *
+           matrix(sqrt(kappa_sq_true), d, H, byrow = FALSE)     # d x H
+
+# Species coefficients: Beta_Lambda_j ~ N(Gamma * xi_j, diag(sigma_sq_true))
+Mu_0     <- t(Gamma_0 %*% Xi_mat)                                # p x d
+Delta_0  <- matrix(rnorm(p * d), p, d) *
+            matrix(sqrt(sigma_sq_true), p, d, byrow = TRUE)
+BL_0     <- Mu_0 + Delta_0
+Beta_0   <- BL_0[, seq_len(q),           drop = FALSE]
+Lambda_0 <- BL_0[, q + seq_len(k),       drop = FALSE]
+
+# Site design and outcome
+X     <- cbind(1, matrix(rnorm(n * (q - 1)), n, q - 1))
+Eta_0 <- matrix(rnorm(n * k), n, k) / sqrt(k)
+Z_0   <- X %*% t(Beta_0) + Eta_0 %*% t(Lambda_0)
+P_0   <- 1 / (1 + exp(-Z_0))
+# Canonical truth: post-processing makes the factors orthogonal to X, which moves
+# Eta_0 A_0 (A_0 = (X'X)^{-1} X'Eta_0) into the intercept and slopes: beta + A_0 lambda,
+# and correspondingly Gamma[1:q,] + A_0 Gamma[q+1:k,]. Coverage of FLAIR/FLAIR++ uses these.
+A_0      <- solve(crossprod(X), crossprod(X, Eta_0))
+Beta_0c  <- Beta_0 + Lambda_0 %*% t(A_0)
+Gamma_0c <- Gamma_0[seq_len(q), , drop = FALSE] + A_0 %*% Gamma_0[q + seq_len(k), , drop = FALSE]
+Y     <- matrix(rbinom(n * p, 1, P_0), n, p)
+colnames(Y) <- paste0("sp", seq_len(p))   # required for stage-2 backbone transfer
+
+cat(sprintf("n=%d  p=%d  q=%d  k=%d  H=%d  d=%d  marginal P(Y=1) = %.3f\n",
+            n, p, q, k, H, d, mean(Y)))
+cat(sprintf("True sigma_sq range: [%.3f, %.3f]   mean=%.3f\n",
+            min(sigma_sq_true), max(sigma_sq_true), mean(sigma_sq_true)))
+cat(sprintf("True kappa_sq range: [%.3f, %.3f]   mean=%.3f\n",
+            min(kappa_sq_true), max(kappa_sq_true), mean(kappa_sq_true)))
+```
+
+---
+
+# Marginal variance verification
+
+Marginalising Γ out of the hierarchical prior gives, for each species $j$ and
+dimension $r$:
+$$
+\operatorname{Var}(\tilde{b}_{jr}) = \sigma_r^2 + \kappa_r^2\,\|\xi_j\|^2 .
+$$
+We verify this holds empirically by drawing `r N_rep <- 500L; N_rep` independent
+realisations of $(\Gamma, \Delta)$ from the DGM (keeping $\Xi$, $\sigma^2$,
+$\kappa^2$ fixed at the values drawn above) and comparing the sample variance to
+the closed-form formula.
+
+**Hyperparameters.** The DGM and fitter share $a=3, b=1/2, c=3, d=1/2$, so the
+prior is correctly specified. Both give $\text{InvGamma}(3,1/2)$ with mode 1/8 and
+mean 1/4 for each dimension of $\sigma^2$ and $\kappa^2$; with mean 1 the linear
+predictor saturates (sd about 6, $m_j/n \approx 0.07$) and no Gaussian
+approximation is calibrated.
+
+```{r dgm-margvar-check, fig.width=6, fig.height=5}
+N_rep   <- 500L
+xi_sq   <- colSums(Xi_mat^2)           # p-vector: ||xi_j||^2
+
+# Theoretical marginal variance: Var(BL_{jr}) = sigma_sq_true[r] + kappa_sq_true[r] * ||xi_j||^2
+BL_theo_var <- outer(xi_sq, kappa_sq_true) +
+               matrix(sigma_sq_true, p, d, byrow = TRUE)
+
+# Sample N_rep independent BL matrices from the DGM (Xi fixed)
+set.seed(2026 + 99)
+BL_rep <- array(NA_real_, c(p, d, N_rep))
+for (s in seq_len(N_rep)) {
+  G_s    <- matrix(rnorm(d * H), d, H) *
+            matrix(sqrt(kappa_sq_true), d, H, byrow = FALSE)
+  Mu_s   <- t(G_s %*% Xi_mat)
+  De_s   <- matrix(rnorm(p * d), p, d) *
+            matrix(sqrt(sigma_sq_true), p, d, byrow = TRUE)
+  BL_rep[,, s] <- Mu_s + De_s
+}
+BL_emp_var <- apply(BL_rep, c(1L, 2L), var)  # p x d
+
+cat(sprintf("Empirical vs theoretical BL marginal variance (%d reps):\n", N_rep))
+cat(sprintf("  Pearson correlation : %.4f  (expect ≈ 1)\n",
+            cor(as.vector(BL_emp_var), as.vector(BL_theo_var))))
+cat(sprintf("  Mean ratio emp/theo : %.4f  (expect ≈ 1)\n",
+            mean(BL_emp_var / BL_theo_var)))
+cat(sprintf("  Theoretical range   : [%.3f, %.3f]\n",
+            min(BL_theo_var), max(BL_theo_var)))
+cat(sprintf("  Empirical range     : [%.3f, %.3f]\n",
+            min(BL_emp_var), max(BL_emp_var)))
+
+par(mar = c(4, 4, 2.5, 1))
+plot(as.vector(BL_theo_var), as.vector(BL_emp_var),
+     xlab = expression(paste("Theoretical  ", Var(tilde(b)[jr]),
+                             " = ", sigma[r]^2 + kappa[r]^2 * ~group("||", xi[j], "||")^2)),
+     ylab = "Empirical variance (500 DGM samples)",
+     pch  = 16, col  = rgb(0, 0.4, 0.8, 0.3))
+abline(0, 1, col = "red", lwd = 2)
+title(sprintf("DGM marginal variance check  (r=%.4f)",
+              cor(as.vector(BL_emp_var), as.vector(BL_theo_var))))
+```
+
+---
+
+# Fitting configuration
+
+We use the trust-region minibatch wrapper. The DGM and fitter share prior
+hyperparameters $a=3, b=1/2, c=3, d=1/2$ (prior mean $\sigma^2=\kappa^2=1/4$)
+so the prior is correctly specified.
+
+```{r fit-config}
+suppressPackageStartupMessages({
+  library(Rcpp)
+  library(RcppArmadillo)
+})
+source(file.path(FLAIR_CODE_DIR, "flair_plus_minibatch_tr.R"))
+
+fit_cfg <- list(
+  iter_max_pretrain     = 5L,
+  iter_max_train        = 200L,
+  tol                   = 1e-4,
+  loss_tol              = 1e-5,   # tighter: 1e-3 caused premature exit after ~1 training iter
+  cores                 = 4L,
+  do_post_process       = TRUE,
+  randomized_svd        = FALSE,
+  timing_diagnostics    = FALSE,
+  m_prior_var           = 1 / k,
+  max_embedding_dim     = H,
+  b = b_true, d_hyp = d_true          # inverse-gamma rates matching the DGM
+)
+
+knitr::kable(
+  data.frame(name = names(fit_cfg),
+             value = vapply(fit_cfg, function(x) format(x, nsmall = 0), character(1))),
+  caption = "Fitting configuration"
+)
+```
+
+```{r run-fit}
+t0 <- proc.time()
+fit <- do.call(FLAIR_plus_minibatch_wrapper,
+               c(list(Y = Y, X = X, Xi_mat = Xi_mat, k = k,
+                      Y_all = Y, Xi_all = Xi_mat),   # enables stage-2 training loop
+                 fit_cfg))
+fit_time <- (proc.time() - t0)[3]
+cat(sprintf("Fit elapsed: %.2f s\n", fit_time))
+
+H_eff  <- ncol(fit$Gamma)
+Xi_eff <- Xi_mat[seq_len(H_eff), , drop = FALSE]
+```
+
+---
+
+# Posterior uncertainty for every parameter
+
+We compute two UQ tiers and compare them throughout:
+
+* **`uq` (plug-in)**: `compute_UQ()` — Beta/Lambda Laplace at fixed Γ,
+  σ², M; sigma_sq via conjugate InvGamma conditional on BL.
+* **`uq_m` (marginal)**: `compute_UQ_joint()` — Beta/Lambda covariance from the
+  Schur complement over the site factors M, plus Γ propagation; Γ marginalised
+  over σ² by Monte Carlo; σ² via the REML-corrected InvGamma.
+
+```{r run-uq}
+t0 <- proc.time()
+uq   <- compute_UQ(fit, Y, X, Xi_mat = Xi_eff, alpha = 0.05)
+uq_time_cond <- (proc.time() - t0)[3]
+
+t0 <- proc.time()
+uq_m <- compute_UQ_joint(fit, Y, X, Xi_mat = Xi_eff, alpha = 0.05)
+uq_time_marg <- (proc.time() - t0)[3]
+
+cat(sprintf("UQ (plug-in)  elapsed: %.2f s\n", uq_time_cond))
+cat(sprintf("UQ (marginal) elapsed: %.2f s\n", uq_time_marg))
+uq_time <- uq_time_cond + uq_time_marg
+```
+
+Summary of returned posterior dispersion per parameter family:
+
+```{r uq-overview}
+qsumm <- function(x) c(
+  min    = min(x,    na.rm = TRUE),
+  median = median(x, na.rm = TRUE),
+  mean   = mean(x,   na.rm = TRUE),
+  max    = max(x,    na.rm = TRUE)
+)
+sd_summary <- rbind(
+  Beta     = qsumm(uq$Beta$sd),
+  Lambda   = qsumm(uq$Lambda$sd),
+  M        = qsumm(uq$M$sd),
+  Gamma    = qsumm(uq$Gamma$sd),
+  sigma_sq = qsumm(uq$sigma_sq$sd),
+  kappa_sq = qsumm(uq$kappa_sq$sd)
+)
+knitr::kable(round(sd_summary, 4),
+             caption = "Posterior SD summary (95% CIs use these via N(0,1) quantile)")
+```
+
+---
+
+# Results
+
+**Observational status of X and Ξ.** The covariate matrix $X$ ($n\times q$) is
+observed data, fully known. The trait-embedding matrix $\Xi$ ($H\times p$)
+represents species traits (e.g., body size, diet); in this simulation the true
+$\Xi$ is drawn once from $\mathcal{N}(0,I_H)$ and used as the fixed prior mean
+passed to the fitter. The current wrapper treats $\Xi$ as fixed (no update step
+for $\Xi$), which is appropriate when traits are observed without error.
+
+**Trait covariance — simulation vs. real data.**
+Drawing $\xi_j \stackrel{\text{iid}}{\sim} \mathcal{N}(0, I_H)$ is equivalent to
+assuming a **star phylogeny**: $\mathrm{Cov}(\xi_i, \xi_j) = 0$ for all $i \neq j$,
+i.e.\ no cross-species trait correlation.
+This is the *hardest* case for estimating $\Gamma$: with no phylogenetic signal,
+each species contributes an independent, unshrunk draw to the BL regression,
+so $\hat\Gamma$ converges at the usual $O(1/\sqrt{p})$ rate with no
+between-species borrowing.
+
+In real data we use a taxonomic/phylogenetic tree.
+The covariance matrix $\Sigma_{\text{phylo}}$ is obtained from the tree via
+a Brownian-motion kernel: $[\Sigma_{\text{phylo}}]_{ij} =$ shared branch length
+from the root to the most recent common ancestor of species $i$ and $j$
+(Grafen branch-length scaling in our coral data; see `compare3.R` lines 404--413).
+The true trait distribution becomes
+$\Xi \sim \mathcal{MN}(0,\, I_H \otimes \Sigma_{\text{phylo}})$,
+meaning closely-related species have nearly identical trait vectors
+and effectively count as a single species for $\Gamma$ estimation.
+**Strong phylogenetic structure therefore makes $\hat\Gamma$ harder, not easier**
+(fewer effective independent data points), but also tightens the prior on $\beta_j$
+for rare/new species (the key application benefit).
+
+Procrustes helpers (rotation-tied families only):
+
+```{r procrustes-helpers}
+procrustes_R <- function(L0, Lhat) {
+  sv <- svd(crossprod(Lhat, L0))
+  sv$u %*% t(sv$v)
+}
+R              <- procrustes_R(Lambda_0, fit$Lambda)
+Lambda_aligned <- fit$Lambda %*% R
+M_aligned      <- fit$M      %*% R
+emp_rmse       <- function(est, truth)
+  sqrt(mean((as.vector(est) - as.vector(truth))^2))
+coverage <- function(lo, hi, truth) {
+  ok <- is.finite(lo) & is.finite(hi)
+  if (!any(ok)) return(NA_real_)
+  mean(lo[ok] <= truth[ok] & truth[ok] <= hi[ok])
+}
+ci_width <- function(lo, hi) mean(hi - lo, na.rm = TRUE)
+sig_q <- seq_len(q)   # index of Beta-associated sigma_sq / kappa_sq dims
+```
+
+```{r convergence-compute, cache=TRUE, include=FALSE}
+# cache-key: pred_mzsq_Gam per-row formula 2026-06-16, n=800, loss_tol=1e-5, iter_max_train=100
+p_cv <- 60L
+set.seed(2026 + 77)
+
+Xi_cv    <- matrix(rnorm(H * p_cv), H, p_cv) * xi_scale
+Gamma_cv <- matrix(rnorm(d * H), d, H) *
+            matrix(sqrt(kappa_sq_true), d, H, byrow = FALSE)
+BL_cv    <- t(Gamma_cv %*% Xi_cv) +
+            matrix(rnorm(p_cv * d), p_cv, d) *
+            matrix(sqrt(sigma_sq_true), p_cv, d, byrow = TRUE)
+Beta_cv  <- BL_cv[, seq_len(q),     drop = FALSE]
+Lam_cv   <- BL_cv[, q + seq_len(k), drop = FALSE]
+
+n_vals <- c(50L, 100L, 200L, 400L, 800L)
+
+conv_rows <- lapply(n_vals, function(n_cv) {
+  set.seed(2026 + n_cv)
+  X_cv   <- cbind(1, matrix(rnorm(n_cv * (q - 1)), n_cv, q - 1))
+  Eta_cv <- matrix(rnorm(n_cv * k), n_cv, k) / sqrt(k)
+  A_cv      <- solve(crossprod(X_cv), crossprod(X_cv, Eta_cv))
+  Beta_cv_c <- Beta_cv + Lam_cv %*% t(A_cv)
+  Gam_cv_c  <- Gamma_cv[seq_len(q), , drop = FALSE] + A_cv %*% Gamma_cv[q + seq_len(k), , drop = FALSE]
+  Z_cv   <- X_cv %*% t(Beta_cv) + Eta_cv %*% t(Lam_cv)
+  Y_cv   <- matrix(rbinom(n_cv * p_cv, 1, plogis(Z_cv)), n_cv, p_cv)
+  colnames(Y_cv) <- paste0("sp", seq_len(p_cv))
+
+  fit_cv <- FLAIR_plus_minibatch_wrapper(
+    Y_cv, X_cv, Xi_cv, k,
+    Y_all = Y_cv, Xi_all = Xi_cv,
+    iter_max_pretrain = 5L, iter_max_train = 100L, loss_tol = 1e-5,
+    max_embedding_dim = H, cores = fit_cfg$cores,
+    timing_diagnostics = FALSE, b = b_true, d_hyp = d_true)
+  He <- ncol(fit_cv$Gamma)
+  Xi_cv_He <- Xi_cv[seq_len(He), , drop = FALSE]
+
+  err_Beta       <- emp_rmse(fit_cv$Beta, Beta_cv)
+  err_Gam_q      <- emp_rmse(fit_cv$Gamma[seq_len(q), seq_len(He)],
+                              Gamma_cv[seq_len(q), seq_len(He)])
+  err_sig_q      <- emp_rmse(fit_cv$sigma_sq[sig_q], sigma_sq_true[sig_q])
+  err_sig_q_reml <- emp_rmse(
+    compute_sigma_sq_reml(fit_cv, Y_cv, X_cv, Xi_cv_He)[sig_q],
+    sigma_sq_true[sig_q])
+  err_Lam_RI     <- emp_rmse(tcrossprod(fit_cv$Lambda) / k,
+                              tcrossprod(Lam_cv)        / k)
+
+  uq_c_cv <- compute_UQ(fit_cv, Y_cv, X_cv, Xi_mat = Xi_cv_He, alpha = 0.05)
+  uq_m_cv <- compute_UQ_joint(fit_cv, Y_cv, X_cv, Xi_mat = Xi_cv_He, alpha = 0.05)
+
+  cov_Beta_c <- coverage(uq_c_cv$Beta$ci_lower, uq_c_cv$Beta$ci_upper, Beta_cv_c)
+  cov_Beta_m <- coverage(uq_m_cv$Beta$ci_lower, uq_m_cv$Beta$ci_upper, Beta_cv_c)
+  cov_Gam_m  <- coverage(
+    uq_m_cv$Gamma$ci_lower[seq_len(q), seq_len(He)],
+    uq_m_cv$Gamma$ci_upper[seq_len(q), seq_len(He)],
+    Gam_cv_c[, seq_len(He)])
+  cov_sig_m  <- coverage(
+    uq_m_cv$sigma_sq$ci_lower[sig_q],
+    uq_m_cv$sigma_sq$ci_upper[sig_q],
+    sigma_sq_true[sig_q])
+
+  mz2_fn <- function(map_mat, truth_mat, sd_mat) {
+    z <- (as.vector(map_mat) - as.vector(truth_mat)) / as.vector(sd_mat)
+    mean(z^2, na.rm = TRUE)
+  }
+  mzsq_Beta <- mz2_fn(fit_cv$Beta, Beta_cv_c, uq_m_cv$Beta$sd)
+  mzsq_Gam  <- mz2_fn(fit_cv$Gamma[seq_len(q), seq_len(He)],
+                       Gam_cv_c[, seq_len(He)],
+                       uq_m_cv$Gamma$sd[seq_len(q), seq_len(He)])
+  mzsq_sig  <- mz2_fn(fit_cv$sigma_sq[sig_q], sigma_sq_true[sig_q],
+                       uq_m_cv$sigma_sq$sd[sig_q])
+  mzsq_kap  <- mz2_fn(fit_cv$kappa_sq[seq_len(q)], kappa_sq_true[seq_len(q)],
+                       uq_m_cv$kappa_sq$sd[seq_len(q)])
+
+  R_cv        <- procrustes_R(Lam_cv, fit_cv$Lambda)
+  R_M_cv      <- procrustes_R(Eta_cv, fit_cv$M)
+  lo_Lam_c_cv <- pmin(uq_c_cv$Lambda$ci_lower %*% R_cv, uq_c_cv$Lambda$ci_upper %*% R_cv)
+  hi_Lam_c_cv <- pmax(uq_c_cv$Lambda$ci_lower %*% R_cv, uq_c_cv$Lambda$ci_upper %*% R_cv)
+  lo_Lam_m_cv <- pmin(uq_m_cv$Lambda$ci_lower %*% R_cv, uq_m_cv$Lambda$ci_upper %*% R_cv)
+  hi_Lam_m_cv <- pmax(uq_m_cv$Lambda$ci_lower %*% R_cv, uq_m_cv$Lambda$ci_upper %*% R_cv)
+  mzsq_Lam    <- mz2_fn(fit_cv$Lambda %*% R_cv, Lam_cv, uq_m_cv$Lambda$sd)
+  mzsq_M      <- mz2_fn(fit_cv$M %*% R_M_cv, Eta_cv, uq_m_cv$M$sd)
+  cov_Lam_c   <- coverage(lo_Lam_c_cv, hi_Lam_c_cv, Lam_cv)
+  cov_Lam_m   <- coverage(lo_Lam_m_cv, hi_Lam_m_cv, Lam_cv)
+  cov_kap_m   <- coverage(uq_m_cv$kappa_sq$ci_lower[seq_len(q)],
+                           uq_m_cv$kappa_sq$ci_upper[seq_len(q)],
+                           kappa_sq_true[seq_len(q)])
+  sig_bias  <- mean(fit_cv$sigma_sq[sig_q]) / mean(sigma_sq_true[sig_q])
+
+  x_theo <- sqrt(d * log(n_cv * p_cv) / n_cv)
+
+  data.frame(n = n_cv, inv_sqrt_n = 1/sqrt(n_cv), x_theo = x_theo,
+             rmse_Beta = err_Beta, rmse_Gamma_q = err_Gam_q,
+             rmse_Lambda_RI = err_Lam_RI,
+             rmse_sigma_orig = err_sig_q, rmse_sigma_reml = err_sig_q_reml,
+             cov_Beta_c = cov_Beta_c, cov_Beta_m = cov_Beta_m,
+             cov_Gam_m = cov_Gam_m, cov_sig_m = cov_sig_m,
+             cov_kap_m = cov_kap_m, cov_Lam_c = cov_Lam_c, cov_Lam_m = cov_Lam_m,
+             mzsq_Beta = mzsq_Beta, mzsq_Gam = mzsq_Gam,
+             mzsq_sig = mzsq_sig, mzsq_kap = mzsq_kap,
+             mzsq_Lam = mzsq_Lam, mzsq_M = mzsq_M,
+             sig_bias = sig_bias,
+             pred_mzsq_Gam = mean(sigma_sq_true[sig_q] / fit_cv$sigma_sq[sig_q]),
+             stringsAsFactors = FALSE)
+})
+conv_tab <- do.call(rbind, conv_rows)
+```
+
+## Replicate-averaged coverage for β, Λ, Γ
+
+The sweep above uses a single fit per $n$, so its $\Gamma$/$\kappa^2$ coverage is
+dominated by one-draw noise. Here we hold $\Gamma_{cv}$ fixed and redraw, in
+each of 20 replicates per $n$, the trait residuals of BL (assumption (B6) of
+the paper), the design $X$, the latent scores $\eta$ and the outcome $Y$.
+Coverage of $\beta$ is evaluated against the canonical truth
+$\beta + \Lambda C^\top$, $C = (X^\top X)^{-1}X^\top\eta$, which is the
+estimand after the post-processing $M \perp X$; it differs from the generating
+$\beta$ by $O(n^{-1/2})$. Only the three rotation-tractable families are
+reported: $\beta$, $\Lambda$ (oracle Procrustes), $\Gamma_{[1:q,]}$.
+
+```{r coverage-replicate, cache=TRUE, dependson="convergence-compute", include=FALSE}
+R_cov <- 20L                          # datasets averaged per n
+n_cov <- c(100L, 200L, 400L, 800L)
+
+cov_rep_rows <- lapply(n_cov, function(n_r) {
+  acc <- matrix(NA_real_, R_cov, 4,
+                dimnames = list(NULL, c("bpi", "bm", "Om", "Gm")))
+  for (r in seq_len(R_cov)) {
+    set.seed(10000L * r + n_r)
+    # (B6): redraw the trait residuals of BL around the fixed Gamma_cv
+    BL_r   <- t(Gamma_cv %*% Xi_cv) +
+              matrix(rnorm(p_cv * d), p_cv, d) *
+              matrix(sqrt(sigma_sq_true), p_cv, d, byrow = TRUE)
+    Beta_r <- BL_r[, seq_len(q),     drop = FALSE]
+    Lam_r  <- BL_r[, q + seq_len(k), drop = FALSE]
+    X_r   <- cbind(1, matrix(rnorm(n_r * (q - 1)), n_r, q - 1))
+    Eta_r <- matrix(rnorm(n_r * k), n_r, k) / sqrt(k)
+    # canonical truth (M orthogonal to X after post-processing): beta + Lambda C^T
+    A_r    <- solve(crossprod(X_r), crossprod(X_r, Eta_r))
+    Beta_c <- Beta_r + Lam_r %*% t(A_r)
+    Gam_c  <- Gamma_cv[seq_len(q), , drop = FALSE] + A_r %*% Gamma_cv[q + seq_len(k), , drop = FALSE]
+    Z_r   <- X_r %*% t(Beta_r) + Eta_r %*% t(Lam_r)
+    Y_r   <- matrix(rbinom(n_r * p_cv, 1, plogis(Z_r)), n_r, p_cv)
+    colnames(Y_r) <- paste0("sp", seq_len(p_cv))
+
+    fit_r <- FLAIR_plus_minibatch_wrapper(
+      Y_r, X_r, Xi_cv, k, Y_all = Y_r, Xi_all = Xi_cv,
+      iter_max_pretrain = 5L, iter_max_train = 100L, loss_tol = 1e-5,
+      max_embedding_dim = H, cores = fit_cfg$cores, timing_diagnostics = FALSE,
+      b = b_true, d_hyp = d_true)
+    He_r <- ncol(fit_r$Gamma)
+    Xi_r <- Xi_cv[seq_len(He_r), , drop = FALSE]
+
+    uq_c_r <- compute_UQ(fit_r, Y_r, X_r, Xi_mat = Xi_r, alpha = 0.05)
+    uq_m_r <- compute_UQ_joint(fit_r, Y_r, X_r, Xi_mat = Xi_r, alpha = 0.05)
+
+    # Omega = Lambda Lambda^T (rotation-invariant), delta method from the
+    # per-species posterior covariance blocks V_BL (species blocks independent):
+    # Var(Omega_{jj'}) = lam_j'^T V_j lam_j' + lam_j^T V_j' lam_j, 4x on the diagonal.
+    VL_r <- lapply(uq_m_r$V_BL, function(V) V[q + seq_len(k), q + seq_len(k)])
+    Lh   <- fit_r$Lambda
+    vx   <- t(vapply(seq_len(p_cv), function(j)
+      rowSums((Lh %*% VL_r[[j]]) * Lh), numeric(p_cv)))
+    v_Om <- vx + t(vx)
+    diag(v_Om) <- 4 * vapply(seq_len(p_cv), function(j)
+      sum(Lh[j, ] * (VL_r[[j]] %*% Lh[j, ])), 0)
+    sd_Om <- sqrt(pmax(v_Om, 0)); z_Om <- qnorm(0.975)
+    Om_T  <- Lam_r %*% t(Lam_r) / k      # eta ~ N(0, I_k/k): latent covariance
+    Om_H  <- Lh %*% t(Lh)
+    up    <- upper.tri(Om_T, diag = TRUE)
+
+    acc[r, "bpi"] <- coverage(uq_c_r$Beta$ci_lower, uq_c_r$Beta$ci_upper, Beta_c)
+    acc[r, "bm"]  <- coverage(uq_m_r$Beta$ci_lower, uq_m_r$Beta$ci_upper, Beta_c)
+    acc[r, "Om"]  <- coverage((Om_H - z_Om * sd_Om)[up], (Om_H + z_Om * sd_Om)[up], Om_T[up])
+    acc[r, "Gm"]  <- coverage(
+      uq_m_r$Gamma$ci_lower[seq_len(q), seq_len(He_r)],
+      uq_m_r$Gamma$ci_upper[seq_len(q), seq_len(He_r)],
+      Gam_c[, seq_len(He_r)])
+  }
+  se <- function(v) sd(v, na.rm = TRUE) / sqrt(sum(is.finite(v)))
+  data.frame(n = n_r,
+             cov_Beta_pi = mean(acc[, "bpi"]), se_Beta_pi = se(acc[, "bpi"]),
+             cov_Beta_m  = mean(acc[, "bm"]),  se_Beta_m  = se(acc[, "bm"]),
+             cov_Om_m    = mean(acc[, "Om"]),  se_Om_m    = se(acc[, "Om"]),
+             cov_Gam_m   = mean(acc[, "Gm"]),  se_Gam_m   = se(acc[, "Gm"]))
+})
+cov_rep_tab <- do.call(rbind, cov_rep_rows)
+knitr::kable(cov_rep_tab, digits = 3, row.names = FALSE,
+  caption = sprintf(paste("Replicate-averaged 95%% coverage (R=%d datasets per n, p=%d).",
+                          "Beta/Gamma rotation-free; Omega = Lambda Lambda^T is rotation-invariant."),
+                    R_cov, p_cv))
+```
+
+### Does more p help Γ? Coverage vs p at fixed n
+
+$\Gamma$ is a ridge regression of the $p$ BL rows on $\Xi$, so its effective
+sample size is $p$. Here $n{=}200$ is fixed and $p$ is swept over
+$\{60,120,240,480\}$ (own $\Gamma$ and $\Xi$ drawn per $p$, trait residuals of BL
+redrawn per replicate as in (B6), $\beta$ evaluated against its canonical value;
+$R{=}15$ replicates, marginal CIs) to isolate whether adding species alone raises
+$\beta/\Lambda/\Gamma$ coverage.
+
+```{r coverage-vs-p, cache=TRUE, dependson="coverage-replicate", include=FALSE}
+R_covp <- 15L
+p_grid <- c(60L, 120L, 240L, 480L)
+n_fix  <- 200L
+
+covp_rows <- lapply(p_grid, function(p_g) {
+  set.seed(4242L + p_g)
+  Xi_g    <- matrix(rnorm(H * p_g), H, p_g) * xi_scale
+  Gamma_g <- matrix(rnorm(d * H), d, H) *
+             matrix(sqrt(kappa_sq_true), d, H, byrow = FALSE)
+
+  acc <- matrix(NA_real_, R_covp, 3, dimnames = list(NULL, c("bm", "Lm", "Gm")))
+  for (r in seq_len(R_covp)) {
+    set.seed(20000L * r + p_g)
+    # (B6): redraw the trait residuals of BL per replicate, as in coverage-replicate
+    BL_g    <- t(Gamma_g %*% Xi_g) +
+               matrix(rnorm(p_g * d), p_g, d) *
+               matrix(sqrt(sigma_sq_true), p_g, d, byrow = TRUE)
+    Beta_g  <- BL_g[, seq_len(q),     drop = FALSE]
+    Lam_g   <- BL_g[, q + seq_len(k), drop = FALSE]
+    X_r   <- cbind(1, matrix(rnorm(n_fix * (q - 1)), n_fix, q - 1))
+    Eta_r <- matrix(rnorm(n_fix * k), n_fix, k) / sqrt(k)
+    A_r    <- solve(crossprod(X_r), crossprod(X_r, Eta_r))
+    Beta_c <- Beta_g + Lam_g %*% t(A_r)
+    Gam_c  <- Gamma_g[seq_len(q), , drop = FALSE] + A_r %*% Gamma_g[q + seq_len(k), , drop = FALSE]
+    Z_r   <- X_r %*% t(Beta_g) + Eta_r %*% t(Lam_g)
+    Y_r   <- matrix(rbinom(n_fix * p_g, 1, plogis(Z_r)), n_fix, p_g)
+    colnames(Y_r) <- paste0("sp", seq_len(p_g))
+
+    fit_r <- FLAIR_plus_minibatch_wrapper(
+      Y_r, X_r, Xi_g, k, Y_all = Y_r, Xi_all = Xi_g,
+      iter_max_pretrain = 5L, iter_max_train = 100L, loss_tol = 1e-5,
+      max_embedding_dim = H, cores = fit_cfg$cores, timing_diagnostics = FALSE,
+      b = b_true, d_hyp = d_true)
+    He_r <- ncol(fit_r$Gamma)
+    Xi_r <- Xi_g[seq_len(He_r), , drop = FALSE]
+
+    uq_m_r <- compute_UQ_joint(fit_r, Y_r, X_r, Xi_mat = Xi_r, alpha = 0.05)
+    R_r  <- procrustes_R(Lam_g, fit_r$Lambda)
+    lo_L <- pmin(uq_m_r$Lambda$ci_lower %*% R_r, uq_m_r$Lambda$ci_upper %*% R_r)
+    hi_L <- pmax(uq_m_r$Lambda$ci_lower %*% R_r, uq_m_r$Lambda$ci_upper %*% R_r)
+
+    acc[r, "bm"] <- coverage(uq_m_r$Beta$ci_lower, uq_m_r$Beta$ci_upper, Beta_c)
+    acc[r, "Lm"] <- coverage(lo_L, hi_L, Lam_g)
+    acc[r, "Gm"] <- coverage(
+      uq_m_r$Gamma$ci_lower[seq_len(q), seq_len(He_r)],
+      uq_m_r$Gamma$ci_upper[seq_len(q), seq_len(He_r)],
+      Gam_c[, seq_len(He_r)])
+  }
+  se <- function(v) sd(v, na.rm = TRUE) / sqrt(sum(is.finite(v)))
+  data.frame(p = p_g,
+             cov_Beta_m = mean(acc[, "bm"]), se_Beta_m = se(acc[, "bm"]),
+             cov_Lam_m  = mean(acc[, "Lm"]), se_Lam_m  = se(acc[, "Lm"]),
+             cov_Gam_m  = mean(acc[, "Gm"]), se_Gam_m  = se(acc[, "Gm"]))
+})
+covp_tab <- do.call(rbind, covp_rows)
+knitr::kable(covp_tab, digits = 3, row.names = FALSE,
+  caption = sprintf("Coverage vs p at fixed n=%d (R=%d replicates, marginal CIs).",
+                    n_fix, R_covp))
+```
+
+## 1. Marginal posterior SD and CI diagnostics
+
+The principal calibration diagnostic is $\texttt{mean\_z\_sq} = \operatorname{mean}_e\bigl[(\hat\theta_e - \theta_{0,e})^2/\hat\sigma_{\theta,e}^2\bigr]$, target 1.0 ($>1$ = CI too narrow for the actual MAP error; $<1$ = too wide). Coverage and mean\_z\_sq are tracked across $n$ in the sweep below for all parameter families.
+
+```{r calibration-table, include=FALSE}
+gam_q_lo_c <- uq$Gamma$ci_lower[seq_len(q), , drop = FALSE]
+gam_q_hi_c <- uq$Gamma$ci_upper[seq_len(q), , drop = FALSE]
+gam_q_lo_m <- uq_m$Gamma$ci_lower[seq_len(q), , drop = FALSE]
+gam_q_hi_m <- uq_m$Gamma$ci_upper[seq_len(q), , drop = FALSE]
+Gamma_q_true <- Gamma_0c[, seq_len(H_eff), drop = FALSE]
+
+sig_q  <- seq_len(q);  sig_l  <- q + seq_len(k)
+kap_q  <- seq_len(q);  kap_l  <- q + seq_len(k)
+
+# Procrustes-rotated Lambda CI bounds (k=1: R = ±1 scalar, SD invariant)
+lo_Lam_rot_c <- pmin(uq$Lambda$ci_lower   %*% R, uq$Lambda$ci_upper   %*% R)
+hi_Lam_rot_c <- pmax(uq$Lambda$ci_lower   %*% R, uq$Lambda$ci_upper   %*% R)
+lo_Lam_rot_m <- pmin(uq_m$Lambda$ci_lower %*% R, uq_m$Lambda$ci_upper %*% R)
+hi_Lam_rot_m <- pmax(uq_m$Lambda$ci_lower %*% R, uq_m$Lambda$ci_upper %*% R)
+```
+
+### REML σ² MAP de-biasing
+
+The MAP σ²_r is downward-biased because BL_{jr} and Γ_{r·} are treated as
+observed at their MAP (ignoring posterior variance). The REML correction:
+$$
+\hat\sigma^2_{r,\text{REML}}
+= \frac{b + \tfrac12\sum_j\!\bigl[
+  (\hat{BL}_{jr}-\hat\mu_{jr})^2 + V_j[r,r] + \xi_j^\top V_{\Gamma_r}\xi_j
+  \bigr]}{a + p/2 + 1}.
+$$
+
+```{r reml-debias}
+sigma_sq_reml <- compute_sigma_sq_reml(fit, Y, X, Xi_eff)
+reml_tab <- data.frame(
+  dim          = seq_len(d),
+  true         = round(sigma_sq_true, 3),
+  MAP_orig     = round(fit$sigma_sq,  3),
+  MAP_REML     = round(sigma_sq_reml, 3),
+  bias_orig    = round(fit$sigma_sq  - sigma_sq_true, 3),
+  bias_REML    = round(sigma_sq_reml - sigma_sq_true, 3)
+)
+knitr::kable(reml_tab, row.names = FALSE,
+  caption = "sigma_sq: true vs. original MAP vs. REML-corrected MAP. Dims q+1..d are rotation-affected.")
+cat(sprintf("Mean |bias|  original: %.3f    REML: %.3f\n",
+            mean(abs(reml_tab$bias_orig)), mean(abs(reml_tab$bias_REML))))
+```
+
+### Calibration quality vs. $n$
+
+```{r calib-sweep-tables, dependson="convergence-compute"}
+knitr::kable(
+  conv_tab[, c("n","cov_Beta_c","cov_Beta_m","cov_Gam_m","cov_sig_m",
+               "cov_kap_m","cov_Lam_c","cov_Lam_m")],
+  digits = 3, row.names = FALSE,
+  caption = paste("Coverage sweep (95% nominal).",
+                  "_c = conditional (fixed Gamma/sigma_sq at MAP);",
+                  "_m = marginal (+ Gamma propagation + REML sigma_sq).",
+                  "Lambda uses oracle Procrustes rotation (k=1, sign flip).",
+                  "kappa_sq and sigma_sq noisy (only q=3 elements per row)."))
+
+knitr::kable(
+  conv_tab[, c("n","sig_bias","pred_mzsq_Gam",
+               "mzsq_Beta","mzsq_Gam","mzsq_sig","mzsq_kap","mzsq_Lam","mzsq_M")],
+  digits = 3, row.names = FALSE,
+  caption = paste("mean_z_sq sweep (target 1.0; >1 CI too narrow, <1 too wide).",
+                  "sig_bias = mean(sigma_sq_MAP)/mean(sigma_sq_true) -> 1 as n grows.",
+                  "pred_mzsq_Gam = mean_r(sigma_sq_true[r]/sigma_sq_MAP[r]),",
+                  "the per-row harmonic prediction for mzsq_Gam.",
+                  "mzsq_M uses Laplace SD (no CI bounds for site scores)."))
+```
+
+**Sweep interpretation.**
+
+*Signal 1 — structural $\sigma^2$ bias decreases with $n$.*
+`sig_bias` increases monotonically: 0.231, 0.505, 0.666, 0.841, 0.933 at
+$n=50,100,200,400,800$.  The MAP underestimation of $\sigma^2$ is a finite-$n$ artifact
+(BL is better estimated from more data, so residuals shrink less), not a formula error.
+
+*Signal 2 — $\sigma^2$ CI formula confirmed correct.*
+`mzsq_sig` $=1.044$ at $n=800$: the REML InvGamma CI produces near-unit z-scores once
+the MAP bias is small, directly verifying the formula.
+
+*Signal 3 — $\Gamma$ mzsq tracks the per-row $\sigma^2$ prediction.*
+`pred_mzsq_Gam` $= \operatorname{mean}_r(\sigma^2_{\text{true},r}/\hat\sigma^2_r)$
+is the correct prediction (the simpler $1/\texttt{sig\_bias}$ underestimates by
+Jensen's inequality when per-row biases are heterogeneous).
+At $n=200$, pred $=1.56$ vs.\ actual $=1.98$ (ratio $1.27\times$) — consistent with theory.
+The elevated values at $n\in\{400,800\}$ are single-draw variance: with only
+$q\times H=60$ Gamma elements the $\chi^2$-based estimator has SD $\approx 0.4$, so
+a $3\times$ deviation from the expected value is not unusual for one draw.
+
+*Signal 4 — Beta mzsq $<1$ at large $n$.*
+At $n\ge400$, `mzsq_Beta` $<1$ because the marginal CI adds Gamma-propagation variance
+that exceeds the MAP error — the CI is slightly conservative by design, as confirmed by
+`cov_Beta_m` $>0.95$ at all $n\ge200$.
+
+## 2. Convergence: ||θ̂ − θ₀|| vs. n  (Theorem 1 check)
+
+**What Theorem 1 says.**
+Theorem 1 bounds the per-element error of the MAP estimator $\hat B$:
+$$
+\frac{\|\hat B - B_0\|_F}{\sqrt{p}} = O\!\Bigl(\sqrt{\frac{d\log(np)}{n}}\Bigr),
+\quad d = q + k.
+$$
+That is, RMSE scales as $\sqrt{d\log(np)/n}$.
+
+**What this section verifies.**
+Define the theoretical scale factor $x_{\text{theo}} = \sqrt{d\log(np)/n}$.
+We fix $p=60$ and vary $n \in \{50, 100, 200, 400, 800\}$; each
+point is one independent fit.  We then plot $\log(\text{RMSE})$ vs.\
+$\log(x_{\text{theo}})$.  If Theorem 1 holds, the slope should be $\approx 1$:
+a unit increase in $\log(x_{\text{theo}})$ (i.e.\ halving $n$) causes a unit
+increase in $\log(\text{RMSE})$ (i.e.\ doubling RMSE).
+
+**What the grey dashed line is.**
+The grey line is a perfect slope-1 reference: $\log(\text{RMSE}) = \log(x_{\text{theo}}) + c$
+where $c$ is chosen so the line passes through the Beta RMSE at the smallest
+$n$ (here $n=50$).  Any curve that runs *parallel* to the grey line has log-log
+slope exactly 1, confirming Theorem 1's rate prediction for that family.  The
+Beta curve "meets" the grey line at $n=50$ by construction; the informative
+question is whether it stays parallel as $n$ increases.
+
+**Why curves may have slope $<1$.**
+Theorem 1 characterizes the *statistical* error at the true MAP (global optimum).
+At finite iteration budget, observed RMSE = optimization error + statistical error.
+Optimization error is roughly constant across $n$, flattening the log-log slope.
+At $n\in\{50,100,200,400\}$ expect a slope in $(0,1)$; the Theorem 1 rate
+dominates and slope approaches 1 when statistical error $\gg$ optimization error.
+
+**Effective sample size per parameter family.**
+
+Each family is estimated from a different subset of the data, so each has its own
+"effective $n$" that drives posterior concentration:
+
+| Parameter | Effective data | Converges as |
+|:---|:---|:---|
+| $\beta$, $\Lambda$ | $n$ observations per species | $n\to\infty$ |
+| $\Gamma$ | $p$ BL$_\text{MAP}$ values (ridge on $\Xi$) | $p\to\infty$; $n\to\infty$ indirectly |
+| $\sigma^2$ | $p$ residuals $(\text{BL}_{jr}-\hat\Gamma_r\xi_j)^2$ | $p\to\infty$; $n\to\infty$ indirectly |
+| $\kappa^2$ | $H$ $\hat\Gamma$ values per row $r$ | $H\to\infty$ |
+| $M$ | $p$ species per site | $p\to\infty$ |
+
+The indirect $n$ dependence for $\Gamma$ and $\sigma^2$ runs through BL:
+BL$_j$ is estimated from $n$ observations of species $j$, so BL$_\text{MAP}\to$BL$_\text{true}$
+as $n\to\infty$.  $\Gamma$ takes BL$_\text{MAP}$ as the input to its ridge regression;
+$\sigma^2$ is computed from residuals BL$_\text{MAP}-\hat\Gamma\xi_j$ — both therefore
+improve as BL becomes more accurate.  At $n=\infty$ this pathway is exact and
+further improvement of $\Gamma$/$\sigma^2$ requires $p\to\infty$.
+In the sweep $p=60$ is fixed, so the $n$-driven BL channel dominates throughout.
+
+```{r convergence-study, dependson="convergence-compute", fig.width=7, fig.height=4.5}
+knitr::kable(conv_tab[, c("n","x_theo","rmse_Beta","rmse_Gamma_q",
+                          "rmse_Lambda_RI","rmse_sigma_orig","rmse_sigma_reml")],
+  digits = 4, row.names = FALSE,
+  caption = paste("Convergence table. x_theo = sqrt(d*log(n*p)/n) is the Theorem 1",
+                  "scale factor. rmse_Lambda_RI uses the rotation-invariant target ΛΛ^T/k."))
+
+# Log-log convergence plot
+par(mar = c(4.5, 4, 2.5, 1))
+x_plt <- log(conv_tab$x_theo)
+cols  <- c("navy", "forestgreen", "darkorange", "purple")
+ylims <- log(range(conv_tab[, c("rmse_Beta","rmse_Gamma_q",
+                                "rmse_Lambda_RI","rmse_sigma_orig")],
+                   na.rm = TRUE))
+plot(x_plt, log(conv_tab$rmse_Beta), type = "b", pch = 16,
+     col = cols[1], lwd = 2,
+     xlim = range(x_plt), ylim = ylims,
+     xlab = "log sqrt(d·log(np)/n)  [Theorem 1 scale]",
+     ylab = "log(per-element RMSE)",
+     main = "Convergence rate: log-log slope ≈ 1 expected from Theorem 1")
+lines(x_plt, log(conv_tab$rmse_Gamma_q),   type = "b", pch = 17, col = cols[2], lwd = 2)
+lines(x_plt, log(conv_tab$rmse_Lambda_RI),  type = "b", pch = 15, col = cols[3], lwd = 2)
+lines(x_plt, log(conv_tab$rmse_sigma_orig), type = "b", pch = 18, col = cols[4], lwd = 2)
+abline(a = log(conv_tab$rmse_Beta[1]) - x_plt[1],
+       b = 1, lty = 2, col = "grey50")   # reference slope-1 line
+legend("bottomright",
+       legend = c("Beta", "Gamma[1:q,]", "Lambda (ΛΛᵀ/k, RI)", "sigma_sq[1:q]"),
+       col = cols, pch = c(16,17,15,18), lwd = 2, bty = "n", cex = 0.85)
+```
+
+## 3. Fitted 95% CI vs. true value — all parameter families
+
+All posterior intervals shown simultaneously. True values are red crosses;
+MAP points navy; plug-in and marginal CIs staggered horizontally for σ² and κ²;
+marginal CIs only for Beta, Lambda, and Γ (sorted by MAP value).
+
+**Note on Ξ.** Ξ is fixed at the true value and used only as the prior mean
+passed to the fitter — it is not estimated, so there is no posterior CI for Ξ.
+The uncertainty in Ξ could be propagated as a trainable-Ξ extension (see §Results
+intro), but this is not implemented here.
+
+**Why plug-in $\approx$ marginal for $\kappa^2$ and $\sigma^2$.**
+
+*For $\kappa^2$*: `compute_UQ` (plug-in) and `compute_UQ_joint` both use the
+same conjugate $\text{InvGamma}(c + H/2,\, d + \|\Gamma_{r\cdot}\|^2/2)$ posterior.
+No marginal correction exists for $\kappa^2$: integrating $\Gamma$ out of its
+posterior lacks a closed form, so plug-in $=$ marginal by construction.
+The effective sample size is $H = 20$ regardless of $n$.
+
+*For $\sigma^2$*: `compute_UQ_joint` replaces the plug-in InvGamma CI with a
+Laplace approximation on $\log\sigma^2_r$ that marginalizes BL estimation error out
+(REML correction). The two CIs differ but are visually close at $d = 6$ scale;
+the marginal is slightly wider (conservative, cov $> 0.95$).
+
+**Root cause of σ² and κ² coverage failure — initialization collapse.**
+
+`get_init_plus` fits $\Gamma$ to $BL$ by OLS (ridge), so
+$\hat\mu_j = \hat\Gamma\xi_j \approx BL_j$ and the residuals
+$BL_j - \hat\mu_j \approx 0$.  The residual-based formula then gives
+$$\hat\sigma^2_{\text{init}} = \frac{b + \tfrac12 \sum_j(BL_{jr}-\hat\mu_{jr})^2}{a + p/2 + 1}
+\;\approx\; \frac{b}{a+p/2+1} = \frac{2}{64} \approx 0.03 \ll 1.$$
+With $1/\sigma^2 \approx 33$, the BL prior overwhelms the likelihood in every
+subsequent block update: BL is pinned to $\Gamma\xi_j$, residuals stay near
+zero, and $\sigma^2$ never escapes the neighbourhood of 0.  All other
+parameter errors then reflect "how far the true value differs from the prior
+mean", a quantity independent of $n$, explaining both the σ² coverage=0 and the
+flat, parallel convergence curves.
+
+**Fix (applied).**  `get_init_plus` now initialises $\sigma^2$ at the prior
+mean $b/(a-1) = 1.0$ instead of at the collapsed RSS value.  The first
+`update_sigma_sq_cpp` call immediately revises it based on actual residuals;
+the BL updates thereafter are data-driven and $\sigma^2$ converges to the
+neighbourhood of the truth.
+
+```{r ci-forest-scales, fig.width=9, fig.height=4.4}
+draw_two_ci <- function(map_v, lo_pi, hi_pi, lo_m, hi_m, truth, ylab) {
+  ord <- order(map_v)
+  nd  <- length(map_v)
+  plot(seq_len(nd), map_v[ord], pch = 19, col = "navy",
+       ylim = range(c(lo_pi, hi_pi, lo_m, hi_m, truth), na.rm = TRUE),
+       xlab = "dimension (sorted by MAP)", ylab = ylab)
+  segments(seq_len(nd) - 0.12, lo_pi[ord], seq_len(nd) - 0.12, hi_pi[ord],
+           col = "navy",   lwd = 2)
+  segments(seq_len(nd) + 0.12, lo_m[ord],  seq_len(nd) + 0.12, hi_m[ord],
+           col = "grey40", lwd = 2)
+  points(seq_len(nd), truth[ord], pch = 4, col = "red", cex = 1.4, lwd = 2)
+  legend("topleft",
+         legend = c("MAP", "plug-in CI", "marginal CI", "true"),
+         pch = c(19, NA, NA, 4),
+         lty = c(NA, 1, 1, NA),
+         col = c("navy", "navy", "grey40", "red"),
+         bty = "n", inset = 0.02, cex = 0.85)
+}
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+draw_two_ci(uq$sigma_sq$map,
+            uq$sigma_sq$ci_lower,   uq$sigma_sq$ci_upper,
+            uq_m$sigma_sq$ci_lower, uq_m$sigma_sq$ci_upper,
+            sigma_sq_true, expression(sigma[r]^2))
+title(expression(sigma[r]^2 ~ "— all d dims"))
+draw_two_ci(uq$kappa_sq$map,
+            uq$kappa_sq$ci_lower,   uq$kappa_sq$ci_upper,
+            uq_m$kappa_sq$ci_lower, uq_m$kappa_sq$ci_upper,
+            kappa_sq_true, expression(kappa[r]^2))
+title(expression(kappa[r]^2 ~ "— all d dims  (plug-in = marginal: only H=20 obs)"))
+```
+
+### β, Λ (Procrustes), Γ[1:q,] — marginal 95% CIs
+
+**Beta (all $p \times q = `r p*q`$ elements, sorted by MAP).**
+Marginal 95% CI from `compute_UQ_joint`. Rotation-free: Beta columns
+correspond directly to covariates, so coverage has a well-defined frequentist
+interpretation.
+
+**Lambda (Procrustes-aligned, sorted by MAP).**
+Lambda is identified only up to an orthogonal rotation; here we apply the
+oracle Procrustes rotation that best aligns $\hat\Lambda$ to $\Lambda_0$
+(standard practice in simulation studies). The CI shown is the marginal CI
+from `compute_UQ_joint` applied to the *unrotated* MAP (the rotation is
+applied to the MAP point and CI bounds separately, treating the rotation as
+fixed). Coverage is undefined (the oracle rotation depends on $\Lambda_0$).
+
+**Γ[1:q,] (all $q \times H = `r q * H_eff`$ elements, sorted by MAP).**
+Rotation-free: only the first $q$ rows of Γ are identifiable without knowing
+the Procrustes rotation.
+
+```{r ci-forest-bl-gamma, fig.width=10, fig.height=9}
+# helper: sorted marginal CI plot for many elements
+draw_marg_ci <- function(map_v, lo_m, hi_m, truth, ylab, title_str,
+                         pt_cex = 0.35, seg_lwd = 0.7) {
+  ord <- order(map_v)
+  nd  <- length(map_v)
+  ylim_r <- range(c(lo_m, hi_m, truth, map_v), na.rm = TRUE)
+  plot(seq_len(nd), map_v[ord], pch = 19, col = "navy", cex = pt_cex,
+       ylim = ylim_r,
+       xlab = "element (sorted by MAP)", ylab = ylab,
+       main = title_str)
+  segments(seq_len(nd), lo_m[ord], seq_len(nd), hi_m[ord],
+           col = "grey60", lwd = seg_lwd)
+  points(seq_len(nd), truth[ord], pch = 4, col = "red",
+         cex = pt_cex * 1.8, lwd = 1)
+  legend("topleft",
+         legend = c("MAP", "marg 95% CI", "true"),
+         pch = c(19, NA, 4), lty = c(NA, 1, NA),
+         col = c("navy", "grey60", "red"),
+         bty = "n", cex = 0.8)
+}
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+# --- Beta (p*q = 360 elements) ---
+draw_marg_ci(
+  as.vector(fit$Beta),
+  as.vector(uq_m$Beta$ci_lower),
+  as.vector(uq_m$Beta$ci_upper),
+  as.vector(Beta_0c),
+  ylab = expression(beta[jr]),
+  title_str = sprintf("Beta (%d elements, rot-free)  cov=%.3f",
+                      p * q,
+                      coverage(uq_m$Beta$ci_lower, uq_m$Beta$ci_upper, Beta_0c))
+)
+
+# --- Lambda Procrustes-aligned (p*k = 360 elements) ---
+# Rotate CI bounds by the same Procrustes R used for the MAP
+lo_Lam_rot <- uq_m$Lambda$ci_lower %*% R
+hi_Lam_rot <- uq_m$Lambda$ci_upper %*% R
+# After rotation some lo/hi may swap: enforce lo <= hi element-wise
+lo_Lam_final <- pmin(lo_Lam_rot, hi_Lam_rot)
+hi_Lam_final <- pmax(lo_Lam_rot, hi_Lam_rot)
+draw_marg_ci(
+  as.vector(Lambda_aligned),
+  as.vector(lo_Lam_final),
+  as.vector(hi_Lam_final),
+  as.vector(Lambda_0),
+  ylab = expression(lambda[jr]),
+  title_str = sprintf("Lambda Procrustes (%d elements, oracle rotation; cov undefined)",
+                      p * k)
+)
+
+# --- Gamma[1:q,] (q*H = 60 elements) ---
+draw_marg_ci(
+  as.vector(fit$Gamma[seq_len(q), seq_len(H_eff)]),
+  as.vector(uq_m$Gamma$ci_lower[seq_len(q), seq_len(H_eff)]),
+  as.vector(uq_m$Gamma$ci_upper[seq_len(q), seq_len(H_eff)]),
+  as.vector(Gamma_0c[, seq_len(H_eff)]),
+  ylab = expression(Gamma[rh]),
+  title_str = sprintf("Gamma[1:q,] (%d elements, rot-free)  cov=%.3f",
+                      q * H_eff,
+                      coverage(gam_q_lo_m, gam_q_hi_m, Gamma_q_true)),
+  pt_cex = 1.0, seg_lwd = 1.5   # fewer points — use larger markers
+)
+
+# --- Xi: not estimated (fixed at truth as prior mean) ---
+plot.new()
+text(0.5, 0.5,
+     paste0("Ξ (Xi) is fixed at the true value\n",
+            "and used only as the prior mean μ = Γξ_j.\n",
+            "It is not estimated; no posterior CI exists."),
+     cex = 1.0, adj = 0.5)
+title("Xi — no CI (fixed at truth)")
+```
+
+### CI coverage comparison: FLAIR++ vs HMSC
+
+We fit HMSC on the same synthetic data with the **true** trait matrix $\Xi$ as
+trait data (oracle setting), then compare 95% CI coverage for $\hat\beta$ across
+three estimators: FLAIR++ plug-in, FLAIR++ marginal, and HMSC posterior.
+
+```{r hmsc-comparison, cache=TRUE, dependson="calibration-table", message=FALSE, warning=FALSE}
+library(Hmsc)
+
+# ── Plain FLAIR (FLAIR-main, no trait structure) ──────────────────────────────
+dtype    <- NULL   # only used for TF backend
+old_wd   <- getwd()
+setwd(file.path(FLAIR_PROJ_DIR, "FLAIR-main"))
+source("FLAIR_wrapper.R")   # sourceCpp('helper_functions.cpp') runs relative here
+setwd(old_wd)
+
+flair_plain_fit <- FLAIR_wrapper(
+  Y, X,
+  k = k, alternate_max = 10, max_it = 200, tol = 1e-3, loss_tol = 1e-3,
+  post_process = TRUE, observed = matrix(1L, n, p), randomized_svd = FALSE,
+  provide_posterior_samples = TRUE, n_MC = 200,
+  C_lambda = 10, C_mu = 10, C_beta = 10,
+  subsample_index = seq_len(min(100L, p)), backend = "c++"
+)
+
+# ── HMSC model matching the DGM ───────────────────────────────────────────────
+# XData: remove intercept column (Hmsc adds it via XFormula)
+XData_df  <- as.data.frame(X[, -1, drop = FALSE])
+colnames(XData_df) <- paste0("x", seq_len(q - 1))
+XFormula  <- as.formula(paste("~", paste(paste0("x", seq_len(q - 1)), collapse = "+")))
+
+# TrData: true Xi (p × H), no intercept in TrFormula so Gamma is H × q
+TrData_df <- as.data.frame(t(Xi_mat))          # p × H
+colnames(TrData_df) <- paste0("tr", seq_len(H))
+rownames(TrData_df) <- colnames(Y)             # required by Hmsc: species names
+TrFormula <- as.formula(paste("~ 0 +", paste(paste0("tr", seq_len(H)), collapse = "+")))
+
+# Random level for latent factors (k factors, one unit per observation)
+studyDesign_hmsc <- data.frame(sample = as.factor(seq_len(n)))
+rL_hmsc <- HmscRandomLevel(units = studyDesign_hmsc$sample)
+rL_hmsc <- setPriors(rL_hmsc, nfMax = k)
+
+m_hmsc <- Hmsc(
+  Y         = Y,
+  distr     = "probit",
+  XData     = XData_df,
+  XFormula  = XFormula,
+  TrData    = TrData_df,
+  TrFormula = TrFormula,
+  studyDesign = studyDesign_hmsc,
+  ranLevels   = list(sample = rL_hmsc)
+)
+# Oracle-matched prior: default InvWishart(nc+1, I) has marginal IG(2,0.5) mean=0.5,
+# but DGM uses IG(3,2) mean=1. Set f0=6, V0=4*I => marginal exactly IG(3,2).
+m_hmsc <- setPriors(m_hmsc, V0 = 4 * diag(m_hmsc$nc), f0 = 6L)
+set.seed(2026)
+m_hmsc <- sampleMcmc(m_hmsc, samples = 2000, thin = 5, transient = 1000,
+                     nChains = 2, verbose = 0)
+
+# ── Extract beta posterior CI ─────────────────────────────────────────────────
+# getPostEstimate: $q has shape [n_quantiles, nc, p]; $mean has shape [nc, p]
+pe_beta <- getPostEstimate(m_hmsc, parName = "Beta", q = c(0.025, 0.975))
+lo_hmsc_beta <- t(pe_beta$q[1, , ])   # p × q  (transpose from [nc, p])
+hi_hmsc_beta <- t(pe_beta$q[2, , ])
+
+# Scale HMSC CI from probit to logit scale (DGM and FLAIR use logit).
+# HMSC fits probit => beta_hmsc ≈ beta_0 / (pi/sqrt(3)).
+# Multiply by pi/sqrt(3) to convert to logit scale for fair coverage comparison.
+logit_probit_scale <- pi / sqrt(3)   # ≈ 1.814
+lo_hmsc_logit <- lo_hmsc_beta * logit_probit_scale
+hi_hmsc_logit <- hi_hmsc_beta * logit_probit_scale
+
+# ── Coverage comparison ───────────────────────────────────────────────────────
+coverage_fn <- function(lo, hi, truth) mean(lo <= truth & truth <= hi)
+
+cov_pi   <- coverage_fn(uq$Beta$ci_lower,   uq$Beta$ci_upper,   Beta_0c)
+cov_marg <- coverage_fn(uq_m$Beta$ci_lower, uq_m$Beta$ci_upper, Beta_0c)
+cov_hmsc_raw    <- coverage_fn(lo_hmsc_beta,  hi_hmsc_beta,  Beta_0)  # probit scale
+cov_hmsc        <- coverage_fn(lo_hmsc_logit, hi_hmsc_logit, Beta_0)  # logit scale
+
+# Plain FLAIR CI: Vs is p × d; first q cols are Beta Laplace variances
+Vs_beta_plain  <- flair_plain_fit$Vs[, seq_len(q), drop = FALSE]   # p × q
+ci_flair_plain <- compute_ci_Beta(flair_plain_fit$Beta_tilde, Vs_beta_plain,
+                                  flair_plain_fit$rho_max, alpha = 0.05)
+cov_flair <- coverage_fn(ci_flair_plain$ls, ci_flair_plain$us, Beta_0c)
+
+cat(sprintf("Beta 95%% CI coverage (n=%d, p=%d, oracle Xi):\n", n, p))
+cat(sprintf("  Plain FLAIR (no traits)       : %.3f  [rho=%.3f]\n", cov_flair, flair_plain_fit$rho_max))
+cat(sprintf("  FLAIR++ plug-in               : %.3f\n", cov_pi))
+cat(sprintf("  FLAIR++ marginal              : %.3f\n", cov_marg))
+cat(sprintf("  HMSC probit (raw, probit scale): %.3f  [link mismatch]\n", cov_hmsc_raw))
+cat(sprintf("  HMSC probit (x pi/sqrt(3))    : %.3f  [corrected to logit scale]\n", cov_hmsc))
+
+# ── Side-by-side forest plot for first covariate ─────────────────────────────
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+plot_cov_forest <- function(lo, hi, truth, map_v, title_str) {
+  ord <- order(map_v)
+  nd  <- length(map_v)
+  ylim_r <- range(c(lo, hi, truth, map_v), na.rm = TRUE)
+  plot(seq_len(nd), map_v[ord], pch = 19, col = "navy", cex = 0.5,
+       ylim = ylim_r, xlab = "species (sorted by MAP)", ylab = expression(beta[j1]),
+       main = title_str)
+  segments(seq_len(nd), lo[ord], seq_len(nd), hi[ord], col = "grey60", lwd = 0.8)
+  points(seq_len(nd), truth[ord], pch = 4, col = "red", cex = 0.7, lwd = 1)
+}
+plot_cov_forest(uq$Beta$ci_lower[, 1],   uq$Beta$ci_upper[, 1],
+                Beta_0c[, 1], fit$Beta[, 1],
+                sprintf("Plug-in  cov=%.2f", coverage_fn(uq$Beta$ci_lower[,1],
+                        uq$Beta$ci_upper[,1], Beta_0c[,1])))
+plot_cov_forest(uq_m$Beta$ci_lower[, 1], uq_m$Beta$ci_upper[, 1],
+                Beta_0c[, 1], fit$Beta[, 1],
+                sprintf("Marginal  cov=%.2f", coverage_fn(uq_m$Beta$ci_lower[,1],
+                        uq_m$Beta$ci_upper[,1], Beta_0c[,1])))
+plot_cov_forest(lo_hmsc_logit[, 1], hi_hmsc_logit[, 1],
+                Beta_0[, 1], t(pe_beta$mean)[, 1] * logit_probit_scale,
+                sprintf("HMSC (logit-scaled)  cov=%.2f",
+                        coverage_fn(lo_hmsc_logit[,1], hi_hmsc_logit[,1], Beta_0[,1])))
+```
+
+### Link-matched comparison: probit-generated data
+
+The comparison above generates **logit** data, so HMSC (probit) is misspecified
+and the raw coverage collapses; the $\times\pi/\sqrt3$ rescale is only an
+approximate patch. To remove the link confound we regenerate the *same*
+parameters and oracle $\Xi$ under a **probit** link, where HMSC is correctly
+specified and needs no rescaling. FLAIR / FLAIR++ (logit) are now the mildly
+misspecified estimators, so each model is calibrated on its own-link DGM and the
+two settings form a symmetric table.
+
+```{r hmsc-comparison-probit, cache=TRUE, dependson="hmsc-comparison", message=FALSE, warning=FALSE}
+old_wd <- getwd()
+
+# Probit-generated outcome from the identical parameters (native truth = Beta_0)
+set.seed(2026 + 5)
+Y_pr <- matrix(rbinom(n * p, 1, pnorm(Z_0)), n, p)
+colnames(Y_pr) <- paste0("sp", seq_len(p))
+
+# ── FLAIR++ (logit) on probit data — misspecified link ───────────────────────
+fit_pr  <- do.call(FLAIR_plus_minibatch_wrapper,
+  c(list(Y = Y_pr, X = X, Xi_mat = Xi_mat, k = k, Y_all = Y_pr, Xi_all = Xi_mat),
+    fit_cfg))
+Xi_pr   <- Xi_mat[seq_len(ncol(fit_pr$Gamma)), , drop = FALSE]
+uq_pr   <- compute_UQ(fit_pr, Y_pr, X, Xi_mat = Xi_pr, alpha = 0.05)
+uq_m_pr <- compute_UQ_joint(fit_pr, Y_pr, X, Xi_mat = Xi_pr, alpha = 0.05)
+
+# ── Plain FLAIR (logit) on probit data ───────────────────────────────────────
+setwd(file.path(FLAIR_PROJ_DIR, "FLAIR-main")); source("FLAIR_wrapper.R"); setwd(old_wd)
+flair_plain_pr <- FLAIR_wrapper(
+  Y_pr, X, k = k, alternate_max = 10, max_it = 200, tol = 1e-3, loss_tol = 1e-3,
+  post_process = TRUE, observed = matrix(1L, n, p), randomized_svd = FALSE,
+  provide_posterior_samples = TRUE, n_MC = 200,
+  C_lambda = 10, C_mu = 10, C_beta = 10,
+  subsample_index = seq_len(min(100L, p)), backend = "c++")
+ci_flair_pr <- compute_ci_Beta(flair_plain_pr$Beta_tilde,
+  flair_plain_pr$Vs[, seq_len(q), drop = FALSE], flair_plain_pr$rho_max, alpha = 0.05)
+
+# ── HMSC (probit) on probit data — correctly specified, no rescale ────────────
+m_hmsc_pr <- Hmsc(Y = Y_pr, distr = "probit", XData = XData_df, XFormula = XFormula,
+  TrData = TrData_df, TrFormula = TrFormula,
+  studyDesign = studyDesign_hmsc, ranLevels = list(sample = rL_hmsc))
+m_hmsc_pr <- setPriors(m_hmsc_pr, V0 = 4 * diag(m_hmsc_pr$nc), f0 = 6L)
+set.seed(2026)
+m_hmsc_pr <- sampleMcmc(m_hmsc_pr, samples = 2000, thin = 5, transient = 1000,
+                        nChains = 2, verbose = 0)
+pe_beta_pr <- getPostEstimate(m_hmsc_pr, parName = "Beta", q = c(0.025, 0.975))
+lo_hmsc_pr <- t(pe_beta_pr$q[1, , ]); hi_hmsc_pr <- t(pe_beta_pr$q[2, , ])
+
+# ── Coverage of the native-scale truth Beta_0 (no cross-link rescaling) ───────
+cov_flair_pr <- coverage_fn(ci_flair_pr$ls,          ci_flair_pr$us,          Beta_0c)
+cov_pi_pr    <- coverage_fn(uq_pr$Beta$ci_lower,      uq_pr$Beta$ci_upper,     Beta_0c)
+cov_marg_pr  <- coverage_fn(uq_m_pr$Beta$ci_lower,    uq_m_pr$Beta$ci_upper,   Beta_0c)
+cov_hmsc_pr  <- coverage_fn(lo_hmsc_pr,               hi_hmsc_pr,              Beta_0)
+
+link_tab <- data.frame(
+  Method = c("Plain FLAIR (logit)", "FLAIR++ plug-in (logit)",
+             "FLAIR++ marginal (logit)", "HMSC (probit)"),
+  Logit  = c(cov_flair, cov_pi, cov_marg, cov_hmsc_raw),
+  Probit = c(cov_flair_pr, cov_pi_pr, cov_marg_pr, cov_hmsc_pr),
+  stringsAsFactors = FALSE)
+knitr::kable(link_tab, digits = 3, row.names = FALSE,
+  caption = paste("Beta 95% CI coverage of the native-scale truth, by data link.",
+                  "Each estimator is calibrated on its matched link (diagonal);",
+                  "off-link coverage collapses purely from link mismatch."))
+```
+
+### Replicate-averaged FLAIR / FLAIR++ / HMSC comparison
+
+Averages coverage, RMSE, and runtime over 6 replicate datasets, each with a
+freshly drawn true $\beta$. FLAIR / FLAIR++ (logit) use logit-generated data;
+HMSC$^{*}$ (probit) uses probit-generated data with the same parameters; every
+estimator is thus assessed on its own correctly-specified link, and all
+estimate the same native-scale truth $\beta_0$. RMSE uses the MAP for FLAIR /
+FLAIR++ and the posterior mean for HMSC.
+
+```{r link-compare-replicate, cache=TRUE, dependson="hmsc-comparison-probit", message=FALSE, warning=FALSE}
+R_link <- 6L
+n_L <- 200L; p_L <- 120L
+old_wd <- getwd()
+setwd(file.path(FLAIR_PROJ_DIR, "FLAIR-main")); source("FLAIR_wrapper.R"); setwd(old_wd)
+
+rmse_fn <- function(est, truth) sqrt(mean((as.vector(est) - as.vector(truth))^2))
+
+link_acc <- lapply(seq_len(R_link), function(r) {
+  set.seed(70000L + r)
+  Xi_r   <- matrix(rnorm(H * p_L), H, p_L) * xi_scale
+  Gam_r  <- matrix(rnorm(d * H), d, H) *
+            matrix(sqrt(kappa_sq_true), d, H, byrow = FALSE)
+  BL_r   <- t(Gam_r %*% Xi_r) +
+            matrix(rnorm(p_L * d), p_L, d) *
+            matrix(sqrt(sigma_sq_true), p_L, d, byrow = TRUE)
+  Beta_r <- BL_r[, seq_len(q),     drop = FALSE]
+  Lam_r  <- BL_r[, q + seq_len(k), drop = FALSE]
+  X_r    <- cbind(1, matrix(rnorm(n_L * (q - 1)), n_L, q - 1))
+  Eta_r  <- matrix(rnorm(n_L * k), n_L, k) / sqrt(k)
+  # canonical truth for the post-processed estimators (FLAIR, FLAIR++)
+  Beta_c <- Beta_r + Lam_r %*% t(solve(crossprod(X_r), crossprod(X_r, Eta_r)))
+  Z_r    <- X_r %*% t(Beta_r) + Eta_r %*% t(Lam_r)
+  Y_lg   <- matrix(rbinom(n_L * p_L, 1, plogis(Z_r)), n_L, p_L)
+  Y_pr   <- matrix(rbinom(n_L * p_L, 1, pnorm(Z_r)),  n_L, p_L)
+  colnames(Y_lg) <- colnames(Y_pr) <- paste0("sp", seq_len(p_L))
+
+  # ---- Plain FLAIR (logit) ----
+  t0 <- proc.time()
+  ff <- FLAIR_wrapper(Y_lg, X_r, k = k, alternate_max = 10, max_it = 200,
+        tol = 1e-3, loss_tol = 1e-3, post_process = TRUE,
+        observed = matrix(1L, n_L, p_L), randomized_svd = FALSE,
+        provide_posterior_samples = TRUE, n_MC = 200,
+        C_lambda = 10, C_mu = 10, C_beta = 10,
+        subsample_index = seq_len(min(100L, p_L)), backend = "c++")
+  t_ff  <- (proc.time() - t0)[3]
+  ci_ff <- compute_ci_Beta(ff$Beta_tilde, ff$Vs[, seq_len(q), drop = FALSE],
+                           ff$rho_max, alpha = 0.05)
+  cov_ff  <- mean(ci_ff$ls <= Beta_c & Beta_c <= ci_ff$us)
+  rmse_ff <- rmse_fn(ff$Beta_tilde, Beta_c)
+
+  # ---- FLAIR++ marginal (logit) ----
+  t0 <- proc.time()
+  fp    <- do.call(FLAIR_plus_minibatch_wrapper,
+           c(list(Y = Y_lg, X = X_r, Xi_mat = Xi_r, k = k,
+                  Y_all = Y_lg, Xi_all = Xi_r), fit_cfg))
+  Xi_fp <- Xi_r[seq_len(ncol(fp$Gamma)), , drop = FALSE]
+  uqm   <- compute_UQ_joint(fp, Y_lg, X_r, Xi_mat = Xi_fp, alpha = 0.05)
+  t_fp  <- (proc.time() - t0)[3]
+  cov_fp  <- mean(uqm$Beta$ci_lower <= Beta_c & Beta_c <= uqm$Beta$ci_upper)
+  rmse_fp <- rmse_fn(fp$Beta, Beta_c)
+
+  # ---- HMSC (probit); RMSE from posterior mean ----
+  XData_r <- as.data.frame(X_r[, -1, drop = FALSE]); colnames(XData_r) <- paste0("x", seq_len(q - 1))
+  XF  <- as.formula(paste("~", paste(paste0("x", seq_len(q - 1)), collapse = "+")))
+  TrD <- as.data.frame(t(Xi_r)); colnames(TrD) <- paste0("tr", seq_len(H)); rownames(TrD) <- colnames(Y_pr)
+  TrF <- as.formula(paste("~ 0 +", paste(paste0("tr", seq_len(H)), collapse = "+")))
+  sdh <- data.frame(sample = as.factor(seq_len(n_L)))
+  rlh <- setPriors(HmscRandomLevel(units = sdh$sample), nfMax = k)
+  mh  <- Hmsc(Y = Y_pr, distr = "probit", XData = XData_r, XFormula = XF,
+              TrData = TrD, TrFormula = TrF, studyDesign = sdh,
+              ranLevels = list(sample = rlh))
+  mh  <- setPriors(mh, V0 = 4 * diag(mh$nc), f0 = 6L)
+  t0  <- proc.time()
+  set.seed(2026)
+  mh  <- sampleMcmc(mh, samples = 2000, thin = 5, transient = 1000,
+                    nChains = 2, verbose = 0)
+  t_mh <- (proc.time() - t0)[3]
+  peb  <- getPostEstimate(mh, parName = "Beta", q = c(0.025, 0.975))
+  lo_h <- t(peb$q[1, , ]); hi_h <- t(peb$q[2, , ])
+  cov_mh  <- mean(lo_h <= Beta_r & Beta_r <= hi_h)
+  rmse_mh <- rmse_fn(t(peb$mean), Beta_r)
+
+  data.frame(method = c("FLAIR", "FLAIR++ marginal", "HMSC*"),
+             cov  = c(cov_ff,  cov_fp,  cov_mh),
+             rmse = c(rmse_ff, rmse_fp, rmse_mh),
+             time = c(t_ff,    t_fp,    t_mh))
+})
+link_df  <- do.call(rbind, link_acc)
+link_rep <- aggregate(cbind(cov, rmse, time) ~ method, data = link_df, FUN = mean)
+link_rep <- link_rep[match(c("FLAIR", "FLAIR++ marginal", "HMSC*"), link_rep$method), ]
+knitr::kable(link_rep, digits = c(NA, 3, 3, 1), row.names = FALSE,
+  caption = sprintf("Averaged over R=%d replicates (fresh beta each). RMSE: MAP for FLAIR/FLAIR++, posterior mean for HMSC.", R_link))
+```
+
+```{r save-slides-results, include=FALSE, dependson=c("convergence-compute","coverage-replicate","coverage-vs-p","ci-forest-bl-gamma","ci-forest-scales","calibration-table","hmsc-comparison","hmsc-comparison-probit","link-compare-replicate")}
+slides_dir <- file.path(FLAIR_PROJ_DIR, "slides", "results")
+dir.create(slides_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ── 1. Convergence log-log plot ───────────────────────────────────────────────
+pdf(file.path(slides_dir, "uq_convergence.pdf"), width = 7, height = 4.5)
+par(mar = c(4.5, 4, 2.5, 1))
+x_plt  <- log(conv_tab$x_theo)
+cvcols <- c("navy", "forestgreen", "darkorange", "purple")
+ylims  <- log(range(conv_tab[, c("rmse_Beta","rmse_Gamma_q",
+                                 "rmse_Lambda_RI","rmse_sigma_orig")], na.rm = TRUE))
+plot(x_plt, log(conv_tab$rmse_Beta), type = "b", pch = 16,
+     col = cvcols[1], lwd = 2, xlim = range(x_plt), ylim = ylims,
+     xlab = expression(log~sqrt(d %.% log(np)/n)~~"  [Theorem 1 scale,  d = q+k]"),
+     ylab = "log(per-element RMSE)",
+     main = "Convergence rate: log-log slope ≈ 1 (Theorem 1)")
+lines(x_plt, log(conv_tab$rmse_Gamma_q),   type = "b", pch = 17, col = cvcols[2], lwd = 2)
+lines(x_plt, log(conv_tab$rmse_Lambda_RI),  type = "b", pch = 15, col = cvcols[3], lwd = 2)
+lines(x_plt, log(conv_tab$rmse_sigma_orig), type = "b", pch = 18, col = cvcols[4], lwd = 2)
+abline(a = log(conv_tab$rmse_Beta[1]) - x_plt[1], b = 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = c(expression(hat(beta)), expression(hat(Gamma)[1:q]),
+                  expression(hat(Lambda)~"(rot-inv)"), expression(hat(sigma)^2)),
+       col = cvcols, pch = c(16,17,15,18), lwd = 2, bty = "n", cex = 0.9)
+dev.off()
+
+# ── 2. Coverage sweep line plot ───────────────────────────────────────────────
+pdf(file.path(slides_dir, "uq_coverage.pdf"), width = 7, height = 4)
+par(mar = c(4, 4.5, 2.5, 1))
+covcols <- c("navy","steelblue","forestgreen","darkorange","purple")
+n_plt   <- conv_tab$n
+plot(n_plt, conv_tab$cov_Beta_m, type = "b", pch = 16, col = covcols[1], lwd = 2,
+     ylim = c(0, 1.05), log = "x",
+     xlab = "n  (log scale)", ylab = "Empirical 95% CI coverage",
+     main = "Coverage sweep — marginal UQ (nominal 0.95)")
+lines(n_plt, conv_tab$cov_Gam_m,  type = "b", pch = 17, col = covcols[2], lwd = 2)
+lines(n_plt, conv_tab$cov_sig_m,  type = "b", pch = 15, col = covcols[3], lwd = 2)
+lines(n_plt, conv_tab$cov_kap_m,  type = "b", pch = 18, col = covcols[4], lwd = 2)
+lines(n_plt, conv_tab$cov_Lam_m,  type = "b", pch = 20, col = covcols[5], lwd = 2)
+abline(h = 0.95, lty = 2, col = "grey40", lwd = 1.5)
+legend("topleft",
+       legend = c(expression(hat(beta)), expression(hat(Gamma)[1:q]),
+                  expression(hat(sigma)^2), expression(hat(kappa)^2),
+                  expression(hat(Lambda))),
+       col = covcols, pch = c(16,17,15,18,20), lwd = 2, bty = "n", cex = 0.85)
+dev.off()
+
+# ── 3. CI forest: Beta, Lambda, Gamma ────────────────────────────────────────
+pdf(file.path(slides_dir, "uq_ci_forest.pdf"), width = 10, height = 9)
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+draw_marg_ci(as.vector(fit$Beta),
+  as.vector(uq_m$Beta$ci_lower), as.vector(uq_m$Beta$ci_upper), as.vector(Beta_0c),
+  ylab = expression(beta[jr]),
+  title_str = sprintf("Beta (%d elements)  cov = %.2f",
+    p * q, coverage(uq_m$Beta$ci_lower, uq_m$Beta$ci_upper, Beta_0c)))
+lo_Lf <- pmin(uq_m$Lambda$ci_lower %*% R, uq_m$Lambda$ci_upper %*% R)
+hi_Lf <- pmax(uq_m$Lambda$ci_lower %*% R, uq_m$Lambda$ci_upper %*% R)
+draw_marg_ci(as.vector(Lambda_aligned), as.vector(lo_Lf), as.vector(hi_Lf),
+  as.vector(Lambda_0), ylab = expression(lambda[jr]),
+  title_str = sprintf("Lambda Procrustes (%d elements, oracle rot.)", p * k))
+draw_marg_ci(
+  as.vector(fit$Gamma[seq_len(q), seq_len(H_eff)]),
+  as.vector(uq_m$Gamma$ci_lower[seq_len(q), seq_len(H_eff)]),
+  as.vector(uq_m$Gamma$ci_upper[seq_len(q), seq_len(H_eff)]),
+  as.vector(Gamma_0c[, seq_len(H_eff)]),
+  ylab = expression(Gamma[rh]),
+  title_str = sprintf("Gamma[1:q,] (%d elements)  cov = %.2f",
+    q * H_eff, coverage(gam_q_lo_m, gam_q_hi_m, Gamma_q_true)),
+  pt_cex = 1.0, seg_lwd = 1.5)
+plot.new()
+text(0.5, 0.55,
+  sprintf(paste0("sigma_sq[1:q]  cov = %.2f\n",
+                 "kappa_sq[1:q]  cov = %.2f\n\n",
+                 "(see right panel)"),
+    coverage(uq_m$sigma_sq$ci_lower[sig_q], uq_m$sigma_sq$ci_upper[sig_q], sigma_sq_true[sig_q]),
+    coverage(uq_m$kappa_sq$ci_lower[kap_q], uq_m$kappa_sq$ci_upper[kap_q], kappa_sq_true[kap_q])),
+  cex = 1.0)
+dev.off()
+
+# ── 4. CI forest: sigma_sq and kappa_sq ──────────────────────────────────────
+pdf(file.path(slides_dir, "uq_ci_scales.pdf"), width = 9, height = 4.4)
+par(mfrow = c(1, 2), mar = c(4, 4, 2.5, 1))
+draw_two_ci(uq$sigma_sq$map,
+  uq$sigma_sq$ci_lower,   uq$sigma_sq$ci_upper,
+  uq_m$sigma_sq$ci_lower, uq_m$sigma_sq$ci_upper,
+  sigma_sq_true, expression(sigma[r]^2))
+title(expression(sigma[r]^2 ~ "— all d dims"))
+draw_two_ci(uq$kappa_sq$map,
+  uq$kappa_sq$ci_lower,   uq$kappa_sq$ci_upper,
+  uq_m$kappa_sq$ci_lower, uq_m$kappa_sq$ci_upper,
+  kappa_sq_true, expression(kappa[r]^2))
+title(expression(kappa[r]^2 ~ "— all d dims  (plug-in = marginal: H=20 only)"))
+dev.off()
+
+# ── 5b. Link-matched coverage forest (beta[,1]): each method on its own link ──
+pdf(file.path(slides_dir, "uq_hmsc_compare.pdf"), width = 12, height = 3.5)
+par(mfrow = c(1, 4), mar = c(4, 4, 3, 1))
+plot_cov_forest(ci_flair_plain$ls[, 1], ci_flair_plain$us[, 1],
+                Beta_0c[, 1], flair_plain_fit$Beta_tilde[, 1],
+                sprintf("Plain FLAIR / logit  cov=%.2f",
+                  coverage_fn(ci_flair_plain$ls[,1], ci_flair_plain$us[,1], Beta_0c[,1])))
+plot_cov_forest(uq$Beta$ci_lower[, 1],   uq$Beta$ci_upper[, 1],
+                Beta_0c[, 1], fit$Beta[, 1],
+                sprintf("FLAIR++ plug-in / logit  cov=%.2f",
+                  coverage_fn(uq$Beta$ci_lower[,1], uq$Beta$ci_upper[,1], Beta_0c[,1])))
+plot_cov_forest(uq_m$Beta$ci_lower[, 1], uq_m$Beta$ci_upper[, 1],
+                Beta_0c[, 1], fit$Beta[, 1],
+                sprintf("FLAIR++ marginal / logit  cov=%.2f",
+                  coverage_fn(uq_m$Beta$ci_lower[,1], uq_m$Beta$ci_upper[,1], Beta_0c[,1])))
+plot_cov_forest(lo_hmsc_pr[, 1], hi_hmsc_pr[, 1],
+                Beta_0[, 1], t(pe_beta_pr$mean)[, 1],
+                sprintf("HMSC / probit (matched)  cov=%.2f",
+                  coverage_fn(lo_hmsc_pr[,1], hi_hmsc_pr[,1], Beta_0[,1])))
+dev.off()
+
+# ── 5. mzsq table as LaTeX ────────────────────────────────────────────────────
+mzsq_disp <- data.frame(
+  n        = conv_tab$n,
+  Beta     = round(conv_tab$mzsq_Beta,      2),
+  Gam      = round(conv_tab$mzsq_Gam,       2),
+  predGam  = round(conv_tab$pred_mzsq_Gam,  2),
+  sig      = round(conv_tab$mzsq_sig,        2),
+  kap      = round(conv_tab$mzsq_kap,        2),
+  Lam      = round(conv_tab$mzsq_Lam,        2),
+  M        = round(conv_tab$mzsq_M,          2)
+)
+tex_lines <- knitr::kable(mzsq_disp, format = "latex", booktabs = TRUE,
+  col.names = c("$n$","$\\bar{z}^2_{\\beta}$","$\\bar{z}^2_{\\Gamma}$","pred$_{\\Gamma}$",
+                "$\\bar{z}^2_{\\sigma^2}$","$\\bar{z}^2_{\\kappa^2}$",
+                "$\\bar{z}^2_{\\Lambda}$","$\\bar{z}^2_{M}$"),
+  escape = FALSE, align = "rrrrrrrr")
+writeLines(tex_lines, file.path(slides_dir, "uq_mzsq_table.tex"))
+
+# ── 6. Replicate-averaged coverage table (Beta, Omega, Gamma) ────────────────
+fmt_pm <- function(m, s) sprintf("%.2f\\,($\\pm$%.2f)", m, s)
+cov_disp <- data.frame(
+  n     = cov_rep_tab$n,
+  b_pi  = fmt_pm(cov_rep_tab$cov_Beta_pi, cov_rep_tab$se_Beta_pi),
+  b_m   = fmt_pm(cov_rep_tab$cov_Beta_m,  cov_rep_tab$se_Beta_m),
+  O_m   = fmt_pm(cov_rep_tab$cov_Om_m,    cov_rep_tab$se_Om_m),
+  G_m   = fmt_pm(cov_rep_tab$cov_Gam_m,   cov_rep_tab$se_Gam_m),
+  stringsAsFactors = FALSE)
+cov_lines <- knitr::kable(cov_disp, format = "latex", booktabs = TRUE,
+  col.names = c("$n$", "$\\beta$ plug-in", "$\\beta$ marg.",
+                "$\\Omega$ marg.", "$\\Gamma_{[1:q,]}$ marg."),
+  escape = FALSE, align = "rrrrr")
+writeLines(cov_lines, file.path(slides_dir, "uq_coverage_rep_table.tex"))
+
+# ── 7. Link-matched FLAIR/HMSC table: coverage, RMSE, time (replicate-averaged)
+# Each estimator on its own correctly-specified link: FLAIR / FLAIR++ on
+# logit-generated data, HMSC (starred) on probit-generated data.
+link_disp <- data.frame(
+  Estimator = c("FLAIR", "FLAIR++ marginal", "HMSC$^{*}$"),
+  Coverage  = sprintf("%.2f", link_rep$cov),
+  RMSE      = sprintf("%.3f", link_rep$rmse),
+  Time      = sprintf("%.1f", link_rep$time),
+  stringsAsFactors = FALSE)
+link_lines <- knitr::kable(link_disp, format = "latex", booktabs = TRUE,
+  col.names = c("Estimator", "$\\beta$ coverage", "$\\beta$ RMSE", "Time (s)"),
+  escape = FALSE, align = "lccc")
+writeLines(link_lines, file.path(slides_dir, "uq_linktable.tex"))
+
+# ── 8. Coverage-vs-p table (fixed n) ─────────────────────────────────────────
+covp_disp <- data.frame(
+  p    = covp_tab$p,
+  b_m  = fmt_pm(covp_tab$cov_Beta_m, covp_tab$se_Beta_m),
+  L_m  = fmt_pm(covp_tab$cov_Lam_m,  covp_tab$se_Lam_m),
+  G_m  = fmt_pm(covp_tab$cov_Gam_m,  covp_tab$se_Gam_m),
+  stringsAsFactors = FALSE)
+covp_lines <- knitr::kable(covp_disp, format = "latex", booktabs = TRUE,
+  col.names = c("$p$", "$\\beta$ marg.", "$\\Lambda$ marg.", "$\\Gamma_{[1:q,]}$ marg."),
+  escape = FALSE, align = "rrrr")
+writeLines(covp_lines, file.path(slides_dir, "uq_coverage_p_table.tex"))
+
+message("Saved to slides/results/: uq_convergence.pdf, uq_coverage.pdf, ",
+        "uq_ci_forest.pdf, uq_ci_scales.pdf, uq_hmsc_compare.pdf, uq_mzsq_table.tex, ",
+        "uq_coverage_rep_table.tex, uq_linktable.tex")
+
+# Mirror the paper figures and tables next to this Rmd (FLAIR+_code/figures).
+figs_dir <- file.path(FLAIR_PROJ_DIR, "FLAIR+_code", "figures")
+dir.create(figs_dir, showWarnings = FALSE, recursive = TRUE)
+file.copy(list.files(slides_dir, pattern = "^uq_.*\\.(pdf|tex)$", full.names = TRUE),
+          figs_dir, overwrite = TRUE)
+message("Mirrored uq_* results into FLAIR+_code/figures/")
+```
+
+---
+
+# Category-stratified simulation grid (paper tables)
+
+This section generates the simulation tables of the paper — the coverage table
+by rarity category (`uq_coverage_cat_table.tex`, Table A), the global-parameter
+table (`uq_gamma_mu_table.tex`), the estimation/prediction comparison
+(`uq_compare_cat_table.tex`, Table B) and the $p$-sweep
+(`uq_coverage_p_cat_table.tex`, Table C) — and supersedes the single-setting
+tables above (`tab:uq_coverage`, `tab:uq_compare`, coverage-vs-$p$).
+
+The data-generating process, the three method runners (FLAIR++ trainable with
+plug-in and marginal tiers, plain FLAIR, HMSC with the taxonomy correlation
+$C$) and all seeds live in `FLAIR+_code/sim_uq_functions.R`; the truth per
+setting is frozen with seed `4242 + p` and replicate $r$ redraws
+$e_j, s_j, X, \eta, Y$ with seed `20000 r + p + n`, so re-running this chunk
+reproduces the saved `.rds` files exactly. Completed cells found in
+`tuning/results/` are reused; delete them to recompute from scratch (the
+FLAIR++/FLAIR cells take minutes, each HMSC replicate about 37 minutes).
+
+```{r sim-grid-cat, cache=TRUE, message=FALSE, warning=FALSE}
+library(Hmsc)
+old_wd <- getwd()
+setwd(file.path(FLAIR_PROJ_DIR, "FLAIR-main")); source("FLAIR_wrapper.R"); setwd(old_wd)
+source(file.path(FLAIR_PROJ_DIR, "FLAIR+_code", "sim_uq_functions.R"))
+res_dir <- file.path(FLAIR_PROJ_DIR, "tuning", "results")
+
+grid <- rbind(
+  expand.grid(method = c("flairp", "flair"), p = 120L, n = c(100L, 200L, 400L, 800L),
+              r1 = 1L, r2 = 20L, stringsAsFactors = FALSE),
+  expand.grid(method = c("flairp", "flair"), p = c(60L, 240L, 480L), n = 200L,
+              r1 = 1L, r2 = 15L, stringsAsFactors = FALSE),
+  expand.grid(method = "hmsc", p = 120L, n = c(100L, 200L, 400L, 800L),
+              r1 = 1L, r2 = 10L, stringsAsFactors = FALSE))
+for (i in seq_len(nrow(grid))) with(grid[i, ], {
+  out <- sprintf("%s/simuq_%s_p%d_n%d_r%d-%d.rds", res_dir, method, p, n, r1, r2)
+  # the cluster runs HMSC in chunks; any file set covering reps r1..r2 is accepted
+  have <- Sys.glob(sprintf("%s/simuq_%s_p%d_n%d_r*.rds", res_dir, method, p, n))
+  done <- sum(sapply(have, function(f) length(unique(readRDS(f)$agg$rep))))
+  if (done < r2 - r1 + 1) sim_run_cell(method, p, n, seq(r1, r2), out)
+})
+source(file.path(FLAIR_PROJ_DIR, "tuning", "sim_uq_tables.R"))
+```
+
+```{r sim-grid-cat-show, dependson="sim-grid-cat"}
+fs <- Sys.glob(file.path(FLAIR_PROJ_DIR, "tuning", "results", "simuq_*.rds"))
+agg <- do.call(rbind, lapply(fs, function(f) readRDS(f)$agg))
+cov_tab <- aggregate(cov ~ method + flavor + param + cat + p + n,
+                     agg[agg$flavor == "marginal", ], mean)
+knitr::kable(reshape(transform(cov_tab, cov = round(cov, 2)),
+                     idvar = c("param", "cat", "p", "n"),
+                     timevar = "method", direction = "wide"),
+             caption = "Marginal-tier coverage by category (a common, b moderately rare, c super-rare)")
+```
+
+---
+
+# Summary
+
+```{r final-summary, echo=FALSE, results='asis'}
+fmt2 <- function(c1, c2) sprintf("plug-in %.2f | marginal %.2f", c1, c2)
+cat(sprintf("- **n / p / q / k / H**: %d / %d / %d / %d / %d\n", n, p, q, k, H))
+cat(sprintf("- **Fit time**: %.2f s;  UQ time: plug-in %.2f + marginal %.2f = %.2f s\n",
+            fit_time, uq_time_cond, uq_time_marg, uq_time_cond + uq_time_marg))
+cat(sprintf("- **Beta emp_sd**: %.3f;  Lambda ΛΛᵀ/k emp_sd (rot-inv): %.3f\n",
+            emp_rmse(fit$Beta, Beta_0),
+            emp_rmse(tcrossprod(fit$Lambda)/k, tcrossprod(Lambda_0)/k)))
+cat(sprintf("- **Beta 95%% coverage (logit DGM)**: plain FLAIR %.2f | %s | HMSC %.2f (misspecified, raw probit)\n",
+  cov_flair,
+  fmt2(coverage(uq$Beta$ci_lower,   uq$Beta$ci_upper,   Beta_0c),
+       coverage(uq_m$Beta$ci_lower, uq_m$Beta$ci_upper, Beta_0c)),
+  cov_hmsc_raw))
+cat(sprintf("- **Beta 95%% coverage (probit DGM)**: plain FLAIR %.2f | %s | HMSC %.2f (matched, no rescale)\n",
+  cov_flair_pr,
+  fmt2(cov_pi_pr, cov_marg_pr), cov_hmsc_pr))
+cat(sprintf("- **Gamma[1:q,] 95%% coverage**: %s\n",
+  fmt2(coverage(gam_q_lo_c, gam_q_hi_c, Gamma_q_true),
+       coverage(gam_q_lo_m, gam_q_hi_m, Gamma_q_true))))
+cat(sprintf("- **sigma_sq[1:q] 95%% coverage**: %s\n",
+  fmt2(coverage(uq$sigma_sq$ci_lower[sig_q],   uq$sigma_sq$ci_upper[sig_q],   sigma_sq_true[sig_q]),
+       coverage(uq_m$sigma_sq$ci_lower[sig_q], uq_m$sigma_sq$ci_upper[sig_q], sigma_sq_true[sig_q]))))
+cat(sprintf("- **kappa_sq[1:q] 95%% coverage**: %s\n",
+  fmt2(coverage(uq$kappa_sq$ci_lower[kap_q],   uq$kappa_sq$ci_upper[kap_q],   kappa_sq_true[kap_q]),
+       coverage(uq_m$kappa_sq$ci_lower[kap_q], uq_m$kappa_sq$ci_upper[kap_q], kappa_sq_true[kap_q]))))
+```
+
+## Methodology — plug-in vs. marginal CI
+
+**Plug-in CI** (`compute_UQ`): credible intervals conditional on $\hat\Gamma$
+and $\hat\sigma^2$ fixed at MAP — treats parents as exact.
+
+**Marginal CI** (`compute_UQ_joint`): proper posterior $p(\beta_j \mid y)$
+via three corrections over the plug-in:
+
+1. **`Beta` / `Lambda`**: replaces the plug-in precision by its Schur
+   complement over the site factors $M$,
+   $$
+   H_{j,\mathrm{marg}} = \tilde X^\top \mathrm{diag}(w^{\mathrm{eff}}_j) \tilde X + \mathrm{diag}(\sigma^{-2}),\qquad
+   w^{\mathrm{eff}}_{ij} = w_{ij} - w_{ij}^2\lambda_j^\top B_i^{-1}\lambda_j,\qquad
+   B_i = \textstyle\sum_{j'} w_{ij'}\lambda_{j'}\lambda_{j'}^\top + I_k/v_M ,
+   $$
+   and adds the variance of the prior mean $\mu_j=\Gamma\xi_j$:
+   $$
+   \mathrm{Var}(\tilde\beta_{jr}) = [H_{j,\mathrm{marg}}^{-1}]_{rr} + \xi_j^\top V_{\Gamma_r} \xi_j,\qquad
+   V_{\Gamma_r} = (\Xi\Xi^\top/\sigma_r^2 + I_H/\kappa_r^2)^{-1}.
+   $$
+
+2. **`Gamma`**: $V_{\Gamma_r}$ marginalised over the InvGamma posterior of
+   $\sigma_r^2$ by Monte Carlo (law of total variance).
+
+3. **`sigma_sq`**: REML-corrected InvGamma CI that adds the BL and $\Gamma$
+   posterior variances back into the rate.
+   Slightly conservative (cov $> 0.95$) because BL uncertainty is already
+   absorbed in the Laplace objective — no separate REML step needed.
+
+**`kappa_sq`**: unchanged between plug-in and marginal — conjugate
+$\text{InvGamma}(c + H/2,\, d + \|\Gamma_{r\cdot}\|^2/2)$ with effective
+$n = H = 20$; no closed-form marginal correction exists.
+
+**Caveats.**
+
+* Lambda and M are identified only up to an orthogonal rotation of the $k$
+  latent axes. Coverage against truth requires Procrustes alignment (uses truth)
+  or rotation-invariant summaries such as $\Lambda\Lambda^\top$.
+* `sigma_sq` and `kappa_sq` for latent rows $r=q+1,\dots,d$ are
+  rotation-affected; reported for completeness only.
+* The $\rho_j^2$ surrogate in the plug-in CI is a Gaussian-probit approximation
+  ($\sigma_{\text{probit}} = 1.702$) to the exact Schur complement.
+

@@ -1,0 +1,7 @@
+results_madagascar/
+numerical_exp_cache/
+numerical_exp_files/
+numerical_exp.html
+.Rhistory
+*.o
+*.so
